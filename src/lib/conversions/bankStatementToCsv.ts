@@ -237,6 +237,14 @@ function categorize(desc: string): string {
   if (/\b(insurance|lic|vps)\b/i.test(d)) return "Insurance";
   if (/\b(cash\s*deposit)\b/i.test(d)) return "Cash Deposit";
   if (/\b(trf)\b/i.test(d)) return "Transfer";
+  if (/\bdirect\s*debit\b/i.test(d)) return "Direct Debit";
+  if (/\bdirect\s*credit\b/i.test(d)) return "Direct Credit";
+  if (/\bfast\s*transfer\b/i.test(d)) return "Transfer";
+  if (/\btransfer\s+to\b/i.test(d)) return "Transfer";
+  if (/\btransfer\s+from\b/i.test(d)) return "Transfer";
+  if (/\badjust\s*purchase\b/i.test(d)) return "Refund";
+  if (/\baldi|coles|woolworths|kmart|costco\b/i.test(d)) return "Groceries";
+  if (/\bhungry\s*jacks|mcdonald|domino|pizza|zomato|swiggy|uber\s*eats\b/i.test(d)) return "Food";
   return "Other";
 }
 
@@ -285,10 +293,243 @@ function extractPayee(desc: string): string {
 }
 
 // ====================================================================
+// COMMBANK / AUSTRALIAN BANK PARSER
+// ====================================================================
+// CommBank format: "DD Mon[YYYY] Description Debit$$BalanceCR" or "Description$Credit$BalanceCR"
+// Amounts prefixed with $, balance suffixed with CR. Debit/Credit separated by $$
+
+// ====================================================================
+// AUSTRALIAN BANK DETECTION & PARSER
+// Handles CommBank, ANZ, NAB — all use "DD Mon" dates + $ amounts
+// ====================================================================
+
+function isAustralianFormat(text: string): boolean {
+  // Check for Australian bank signatures
+  if (/\b(CommBank|Commonwealth|NetBank)\b/i.test(text) && /\$[\d,]+\.\d{2}CR/i.test(text)) return true;
+  if (/\bANZ\b/.test(text) && /\bblank\b/.test(text)) return true;
+  if (/\bNational\s*Australia\s*Bank\b/i.test(text) || /\bNAB\b/.test(text)) return true;
+  // Generic: Australian $ amounts with CR/DR suffix
+  if (/\$\s*[\d,]+\.\d{2}\s*(?:CR|DR)/i.test(text) && /\b(AUS|VIC|NSW|QLD)\b/.test(text)) return true;
+  return false;
+}
+
+function parseAustralian(text: string): Transaction[] {
+  // --- Detect which bank ---
+  const isCommBank = /\b(CommBank|Commonwealth|NetBank)\b/i.test(text);
+  const isANZ = /\bANZ\b/.test(text) && /\bblank\b/.test(text);
+  const isNAB = /\bNational\s*Australia\s*Bank\b/i.test(text) || (/\bNAB\b/.test(text) && /Cr\s*$/.test(text));
+
+  // --- NAB preprocessing: insert spaces in spaceless text ---
+  if (isNAB) {
+    // Fix date-glued lines: "1Sep2025SumSokheng" → "1 Sep 2025 SumSokheng"
+    const nabDateRe = new RegExp(`(\\d{1,2})(${MONTHS})(\\d{4})`, "gi");
+    text = text.replace(nabDateRe, "$1 $2 $3 ");
+    // Fix amount-glued: "...500.00\n" is usually fine, but "amount Cr" needs space
+    text = text.replace(/([\d,]+\.\d{2})(Cr|Dr)/gi, "$1 $2");
+    // Remove dot separators: "SumSokheng..........500.00" → "SumSokheng 500.00"
+    text = text.replace(/\.{3,}/g, " ");
+  }
+
+  const lines = text.split("\n");
+
+  // --- Extract statement year ---
+  let statementYear = new Date().getFullYear();
+  for (const line of lines) {
+    // "Period18 Oct 2024 - 17 Jan 2025" or "28 NOVEMBER 2025 TO 31 DECEMBER 2025"
+    const ym = line.match(/(\d{4})\s*(?:to|-)\s*\d/i);
+    if (ym) { statementYear = parseInt(ym[1]); break; }
+    const ym2 = line.match(/(?:period|starts?|ends?)\s*.*?(\d{4})/i);
+    if (ym2) { statementYear = parseInt(ym2[1]); break; }
+  }
+
+  const txnDateRe = new RegExp(`^(\\d{1,2})\\s+(${MONTHS})`, "i");
+
+  // --- Filter noise ---
+  const filtered = lines.filter(l => {
+    const t = l.trim();
+    if (!t) return false;
+    if (/^statement\s+\d+|^\(page\s+\d+/i.test(t)) return false;
+    if (/^account\s*(number|details|descriptor)/i.test(t)) return false;
+    if (/^(date|transaction\s*details?)\s*$/i.test(t)) return false;
+    if (/^transactiondebitcreditbalance$/i.test(t.replace(/\s+/g, ""))) return false;
+    if (/^13\d{3}\.\d+.*ZZ/i.test(t)) return false;
+    if (/^(SL\.R3|V\d{2}\.\d{2})/i.test(t)) return false;
+    if (/^06\s+\d{4}\s+\d+/.test(t)) return false;
+    if (/^(name|note):/i.test(t)) return false;
+    if (/smart\s*access|enjoy\s+the\s+convenience/i.test(t)) return false;
+    if (/checked\s+your\s+statement|logging\s+on\s+to/i.test(t)) return false;
+    if (/cheque\s+proceeds|questions\s+on\s+fees/i.test(t)) return false;
+    if (/the\s+date\s+of\s+transactions|appears\s+on\s+the/i.test(t)) return false;
+    if (/enquiries|need\s+to\s+get\s+in\s+touch/i.test(t) && !/\d+\.\d{2}/.test(t)) return false;
+    if (/please\s+retain|taxation\s+purposes/i.test(t)) return false;
+    if (/^page\s+\d+\s+of\s+\d+$/i.test(t)) return false;
+    if (/^withdrawals\s*\(\$\)|^deposits\s*\(\$\)|^balance\s*\(\$\)/i.test(t)) return false;
+    if (/australia\s+and\s+new\s+zealand\s+banking/i.test(t)) return false;
+    if (/^\d+\s*$/.test(t)) return false;
+    return true;
+  });
+
+  // --- Merge continuation lines ---
+  const merged: string[] = [];
+  for (const line of filtered) {
+    const trimmed = line.trim();
+    if (txnDateRe.test(trimmed)) {
+      merged.push(trimmed);
+    } else if (merged.length > 0) {
+      merged[merged.length - 1] += " " + trimmed;
+    }
+  }
+
+  const transactions: Transaction[] = [];
+
+  for (const line of merged) {
+    const dateMatch = txnDateRe.exec(line);
+    if (!dateMatch) continue;
+
+    const day = dateMatch[1];
+    const month = dateMatch[2];
+    let rest = line.substring(dateMatch[0].length).trim();
+
+    // Check if year follows
+    let year = statementYear.toString();
+    const yearMatch = rest.match(/^(\d{4})\s*/);
+    if (yearMatch) {
+      year = yearMatch[1];
+      rest = rest.substring(yearMatch[0].length);
+    }
+
+    const dateStr = normalizeDate(day, month, year);
+
+    // Skip balance lines
+    if (/opening\s*balance|closing\s*balance|brought\s*forward/i.test(rest)) continue;
+
+    let withdrawal = "";
+    let deposit = "";
+    let balance = "";
+    let cleanDesc = rest;
+
+    if (isCommBank) {
+      // CommBank: "desc amount$$balanceCR" or "desc$credit$balanceCR"
+      const balMatch = rest.match(/\$([\d,]+\.\d{2})(?:CR|DR)\s*$/i);
+      if (balMatch) {
+        balance = parseFloat(balMatch[1].replace(/,/g, "")).toFixed(2);
+        cleanDesc = rest.substring(0, rest.lastIndexOf(balMatch[0]));
+      }
+      const debitMatch = cleanDesc.match(/([\d,]+\.\d{2})\$\$\s*$/);
+      if (debitMatch) {
+        withdrawal = parseFloat(debitMatch[1].replace(/,/g, "")).toFixed(2);
+        cleanDesc = cleanDesc.substring(0, cleanDesc.lastIndexOf(debitMatch[0]));
+      } else {
+        const creditMatch = cleanDesc.match(/\$([\d,]+\.\d{2})\$\s*$/);
+        if (creditMatch) {
+          deposit = parseFloat(creditMatch[1].replace(/,/g, "")).toFixed(2);
+          cleanDesc = cleanDesc.substring(0, cleanDesc.lastIndexOf(creditMatch[0]));
+        } else {
+          const singleMatch = cleanDesc.match(/([\d,]+\.\d{2})\$?\s*$/);
+          if (singleMatch) {
+            const before = cleanDesc.substring(0, cleanDesc.lastIndexOf(singleMatch[0]));
+            if (before.endsWith("$")) {
+              deposit = parseFloat(singleMatch[1].replace(/,/g, "")).toFixed(2);
+              cleanDesc = before.slice(0, -1);
+            } else {
+              withdrawal = parseFloat(singleMatch[1].replace(/,/g, "")).toFixed(2);
+              cleanDesc = before;
+            }
+          }
+        }
+      }
+    } else if (isANZ) {
+      // ANZ: "desc AMOUNT blank BALANCE" or "desc blank AMOUNT BALANCE"
+      // "blank" is literal text meaning the column is empty
+      // Pattern: withdrawal blank balance OR blank deposit balance
+      const anzMatch = rest.match(/([\d,]+\.\d{2})\s+blank\s+([\d,]+\.\d{2})\s*$/);
+      if (anzMatch) {
+        withdrawal = parseFloat(anzMatch[1].replace(/,/g, "")).toFixed(2);
+        balance = parseFloat(anzMatch[2].replace(/,/g, "")).toFixed(2);
+        cleanDesc = rest.substring(0, rest.indexOf(anzMatch[0]));
+      } else {
+        const anzCrMatch = rest.match(/blank\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s*$/);
+        if (anzCrMatch) {
+          deposit = parseFloat(anzCrMatch[1].replace(/,/g, "")).toFixed(2);
+          balance = parseFloat(anzCrMatch[2].replace(/,/g, "")).toFixed(2);
+          cleanDesc = rest.substring(0, rest.indexOf(anzCrMatch[0]));
+        } else {
+          // Just amounts at the end
+          const amounts = extractAmounts(rest);
+          if (amounts.length >= 2) {
+            balance = amounts[amounts.length - 1].toFixed(2);
+            withdrawal = amounts[amounts.length - 2].toFixed(2);
+            cleanDesc = rest.replace(/[\d,]+\.\d{2}/g, "").trim();
+          }
+        }
+      }
+    } else {
+      // NAB or generic Australian
+      // NAB format after preprocessing: "1 Sep 2025 SumSokheng 500.00" or "1 Sep 2025 Broughtforward 61,050.02 Cr"
+      // Balance has Cr/Dr suffix, amounts are plain numbers
+
+      // Check for Cr/Dr balance at end
+      const crMatch = rest.match(/([\d,]+\.\d{2})\s*(?:Cr|CR|Dr|DR)\s*$/i);
+      if (crMatch) {
+        balance = parseFloat(crMatch[1].replace(/,/g, "")).toFixed(2);
+        cleanDesc = rest.substring(0, rest.lastIndexOf(crMatch[0])).trim();
+      }
+
+      // NAB has columns: Debits | Credits | Balance
+      // After removing balance (with Cr), remaining amounts are debit or credit
+      const amounts = extractAmounts(cleanDesc);
+      if (amounts.length >= 2) {
+        // Two amounts: first is debit, second is credit (one might be from description)
+        withdrawal = amounts[amounts.length - 1].toFixed(2);
+        cleanDesc = cleanDesc.replace(/[\d,]+\.\d{2}/g, "").trim();
+      } else if (amounts.length === 1) {
+        const amt = amounts[0];
+        const amtStr = cleanDesc.match(/[\d,]+\.\d{2}/g);
+        if (amtStr) {
+          const lastAmt = amtStr[amtStr.length - 1];
+          const idx = cleanDesc.lastIndexOf(lastAmt);
+          const beforeAmt = cleanDesc.substring(0, idx).trim();
+          // Check if it's a deposit (credit keywords or "Cr" context)
+          if (/\bcredit|salary|deposit|refund|payment\s+received|direct\s+credit\b/i.test(beforeAmt)) {
+            deposit = amt.toFixed(2);
+          } else {
+            // Use balance to determine direction if available
+            withdrawal = amt.toFixed(2);
+          }
+          cleanDesc = beforeAmt;
+        }
+      }
+    }
+
+    // Clean description
+    cleanDesc = cleanDesc
+      .replace(/\$+/g, " ")
+      .replace(/Card\s+xx\d+/gi, "")
+      .replace(/Value\s+Date:\s*\d{1,2}\/\d{1,2}\/\d{4}/gi, "")
+      .replace(/EFFECTIVE\s+DATE\s+\d{1,2}\s+\w+\s+\d{4}/gi, "")
+      .replace(/\bblank\b/gi, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (dateStr && (withdrawal || deposit || cleanDesc)) {
+      transactions.push({ date: dateStr, description: cleanDesc || "N/A", withdrawal, deposit, balance });
+    }
+  }
+
+  return transactions;
+}
+
+// ====================================================================
 // MAIN PARSER
 // ====================================================================
 
 function parseTransactions(text: string): Transaction[] {
+  // Try Australian bank format first
+  if (isAustralianFormat(text)) {
+    console.log("[Parser] Detected Australian bank format");
+    return parseAustralian(text);
+  }
+
   // --- Preprocess: fix split lines, concatenated amounts, page footers ---
   const processed = preprocessText(text);
   const allLines = processed.split("\n");
