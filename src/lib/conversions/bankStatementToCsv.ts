@@ -288,7 +288,13 @@ function extractPayee(desc: string): string {
   // Union Bank: BY/TO TRANSFER
   const union = desc.match(/(?:BY|TO)\s+TRANSFER[-\s]+(.+)/i);
   if (union) return union[1].trim().substring(0, 50);
-  // Fallback
+  // Direct Debit/Credit: "Direct Debit 503543 LEAPTEL" → "LEAPTEL"
+  const directDebit = desc.match(/Direct\s+(?:Debit|Credit)\s+\d*\s*(.+)/i);
+  if (directDebit) return directDebit[1].trim().substring(0, 50);
+  // Merchant name with location: "ALDI STORES, TARNEIT" → "ALDI STORES"
+  const merchantComma = desc.match(/^([^,]+),/);
+  if (merchantComma && merchantComma[1].length > 2) return merchantComma[1].trim().substring(0, 50);
+  // Fallback: clean and return first meaningful part
   return desc.replace(/\b[A-Z]{4}0\d{6}\b/g, "").replace(/\b\d{10,}\b/g, "").trim().substring(0, 50);
 }
 
@@ -342,7 +348,8 @@ function parseAustralian(text: string): Transaction[] {
     if (ym2) { statementYear = parseInt(ym2[1]); break; }
   }
 
-  const txnDateRe = new RegExp(`^(\\d{1,2})\\s+(${MONTHS})`, "i");
+  // Match "DD Mon" optionally followed by "YY" or "YYYY" (Bendigo: "10 Sep 25", CommBank: "18 Oct2024")
+  const txnDateRe = new RegExp(`^(\\d{1,2})\\s+(${MONTHS})\\s*(\\d{2,4})?`, "i");
 
   // --- Filter noise ---
   const filtered = lines.filter(l => {
@@ -365,6 +372,11 @@ function parseAustralian(text: string): Transaction[] {
     if (/^page\s+\d+\s+of\s+\d+$/i.test(t)) return false;
     if (/^withdrawals\s*\(\$\)|^deposits\s*\(\$\)|^balance\s*\(\$\)/i.test(t)) return false;
     if (/australia\s+and\s+new\s+zealand\s+banking/i.test(t)) return false;
+    if (/transaction\s*totals|closing\s*balance/i.test(t)) return false;
+    if (/bendigo\s+and\s+adelaide/i.test(t)) return false;
+    if (/platinum\s*rewards/i.test(t)) return false;
+    if (/credit\s*limit|available\s*credit|annual\s*(purchase|cash)/i.test(t)) return false;
+    if (/minimum\s*payment|payment\s*due/i.test(t)) return false;
     if (/^\d+\s*$/.test(t)) return false;
     return true;
   });
@@ -388,20 +400,25 @@ function parseAustralian(text: string): Transaction[] {
 
     const day = dateMatch[1];
     const month = dateMatch[2];
+    const capturedYear = dateMatch[3];
     let rest = line.substring(dateMatch[0].length).trim();
 
-    // Check if year follows
+    // Use captured year, or check if rest starts with year, else use statement year
     let year = statementYear.toString();
-    const yearMatch = rest.match(/^(\d{4})\s*/);
-    if (yearMatch) {
-      year = yearMatch[1];
-      rest = rest.substring(yearMatch[0].length);
+    if (capturedYear) {
+      year = capturedYear;
+    } else {
+      const yearMatch = rest.match(/^(\d{4})\s*/);
+      if (yearMatch) {
+        year = yearMatch[1];
+        rest = rest.substring(yearMatch[0].length);
+      }
     }
 
     const dateStr = normalizeDate(day, month, year);
 
-    // Skip balance lines
-    if (/opening\s*balance|closing\s*balance|brought\s*forward/i.test(rest)) continue;
+    // Skip balance/totals lines
+    if (/opening\s*balance|closing\s*balance|brought\s*forward|transaction\s*totals/i.test(rest)) continue;
 
     let withdrawal = "";
     let deposit = "";
