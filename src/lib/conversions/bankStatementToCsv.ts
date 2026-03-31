@@ -342,6 +342,7 @@ function parseTransactions(text: string): Transaction[] {
     if (before) allParts.push(before);
     if (after) allParts.push(after);
 
+    
     // Collect continuation lines until the next date
     let j = i + 1;
     while (j < lines.length) {
