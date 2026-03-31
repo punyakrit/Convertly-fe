@@ -377,6 +377,10 @@ function parseAustralian(text: string): Transaction[] {
     if (/platinum\s*rewards/i.test(t)) return false;
     if (/credit\s*limit|available\s*credit|annual\s*(purchase|cash)/i.test(t)) return false;
     if (/minimum\s*payment|payment\s*due/i.test(t)) return false;
+    if (/^(free\s+chargeable|unit\s*price|fee\s*charged|staff\s*assisted)/i.test(t)) return false;
+    if (/^(cheques?\s*written|account\s*fee)\b/i.test(t)) return false;
+    if (/opening\s*balance.*total\s*debits.*total\s*credits/i.test(t)) return false;
+    if (/^\$[\d,]+\.\d{2}\s*(CR|DR)\s*\$[\d,]+/i.test(t)) return false; // summary row like "$692.42 CR $29,508.54"
     if (/^\d+\s*$/.test(t)) return false;
     return true;
   });
@@ -417,8 +421,11 @@ function parseAustralian(text: string): Transaction[] {
 
     const dateStr = normalizeDate(day, month, year);
 
-    // Skip balance/totals lines
-    if (/opening\s*balance|closing\s*balance|brought\s*forward|transaction\s*totals/i.test(rest)) continue;
+    // Skip balance/totals/fee/summary lines
+    if (/opening\s*balance|closing\s*balance|brought\s*forward/i.test(rest)) continue;
+    if (/transaction\s*(totals|summary|type)/i.test(rest)) continue;
+    if (/^(free|chargeable|unit\s*price|fee\s*charged|staff\s*assisted|cheques\s*written|total\s|account\s*fee)/i.test(rest)) continue;
+    if (/opening\s*balance.*total\s*debits/i.test(rest)) continue;
 
     let withdrawal = "";
     let deposit = "";
@@ -459,35 +466,63 @@ function parseAustralian(text: string): Transaction[] {
         .trim();
 
     } else if (isCommBank) {
-      // CommBank: "desc amount$$balanceCR" or "desc$credit$balanceCR"
-      const balMatch = rest.match(/\$([\d,]+\.\d{2})(?:CR|DR)\s*$/i);
+      // CommBank: "desc [Card xx2466] [Value Date: DD/MM/YYYY] amount$$balanceCR"
+      // CRITICAL: Strip "Value Date: DD/MM/YYYY" FIRST — the year glues to the amount
+      // e.g. "Value Date: 11/01/20255.99$$4,487.06CR" → year 2025 + amount 5.99 = "20255.99"
+      let amountStr = rest;
+
+      // Insert space between Value Date year and amount: "20255.99" → "2025 5.99"
+      amountStr = amountStr.replace(
+        /Value\s*Date:\s*\d{1,2}\/\d{1,2}\/(\d{4})(\d)/gi,
+        "Value Date: __/$1 $2"
+      );
+
+      // Also handle case where Value Date is cleanly separated
+      amountStr = amountStr.replace(/Value\s*Date:\s*\d{1,2}\/\d{1,2}\/\d{4}/gi, " ");
+
+      // Strip Card info before amount extraction
+      amountStr = amountStr.replace(/Card\s+xx\d+/gi, " ");
+
+      // Find the balance (ends with $amount CR/DR)
+      const balMatch = amountStr.match(/\$([\d,]+\.\d{2})\s*(?:CR|DR)\s*$/i);
       if (balMatch) {
         balance = parseFloat(balMatch[1].replace(/,/g, "")).toFixed(2);
-        cleanDesc = rest.substring(0, rest.lastIndexOf(balMatch[0]));
+        amountStr = amountStr.substring(0, amountStr.lastIndexOf(balMatch[0]));
       }
-      const debitMatch = cleanDesc.match(/([\d,]+\.\d{2})\$\$\s*$/);
+
+      // Debit pattern: "amount$$" (empty credit between double dollar)
+      const debitMatch = amountStr.match(/([\d,]+\.\d{2})\$\$\s*$/);
       if (debitMatch) {
         withdrawal = parseFloat(debitMatch[1].replace(/,/g, "")).toFixed(2);
-        cleanDesc = cleanDesc.substring(0, cleanDesc.lastIndexOf(debitMatch[0]));
       } else {
-        const creditMatch = cleanDesc.match(/\$([\d,]+\.\d{2})\$\s*$/);
+        // Credit pattern: "$amount$" at end
+        const creditMatch = amountStr.match(/\$([\d,]+\.\d{2})\$\s*$/);
         if (creditMatch) {
           deposit = parseFloat(creditMatch[1].replace(/,/g, "")).toFixed(2);
-          cleanDesc = cleanDesc.substring(0, cleanDesc.lastIndexOf(creditMatch[0]));
         } else {
-          const singleMatch = cleanDesc.match(/([\d,]+\.\d{2})\$?\s*$/);
+          // Single amount at end
+          const singleMatch = amountStr.match(/([\d,]+\.\d{2})\$?\s*$/);
           if (singleMatch) {
-            const before = cleanDesc.substring(0, cleanDesc.lastIndexOf(singleMatch[0]));
-            if (before.endsWith("$")) {
+            const before = amountStr.substring(0, amountStr.lastIndexOf(singleMatch[0]));
+            if (before.trimEnd().endsWith("$")) {
               deposit = parseFloat(singleMatch[1].replace(/,/g, "")).toFixed(2);
-              cleanDesc = before.slice(0, -1);
             } else {
               withdrawal = parseFloat(singleMatch[1].replace(/,/g, "")).toFixed(2);
-              cleanDesc = before;
             }
           }
         }
       }
+
+      // Clean the description: remove amounts, Card info, Value Date, $ signs
+      cleanDesc = rest
+        .replace(/Value\s*Date:\s*\d{1,2}\/\d{1,2}\/\d{4}/gi, "")
+        .replace(/Card\s+xx\d+/gi, "")
+        .replace(/[\d,]+\.\d{2}/g, "")
+        .replace(/\$+/g, " ")
+        .replace(/\s*CR\s*$/i, "")
+        .replace(/AUS\s*$/i, "")
+        .replace(/\s+/g, " ")
+        .trim();
     } else if (isANZ) {
       // ANZ: "desc AMOUNT blank BALANCE" or "desc blank AMOUNT BALANCE"
       // "blank" is literal text meaning the column is empty
