@@ -304,11 +304,10 @@ function extractPayee(desc: string): string {
 // ====================================================================
 
 function isAustralianFormat(text: string): boolean {
-  // Check for Australian bank signatures
   if (/\b(CommBank|Commonwealth|NetBank)\b/i.test(text) && /\$[\d,]+\.\d{2}CR/i.test(text)) return true;
   if (/\bANZ\b/.test(text) && /\bblank\b/.test(text)) return true;
   if (/\bNational\s*Australia\s*Bank\b/i.test(text) || /\bNAB\b/.test(text)) return true;
-  // Generic: Australian $ amounts with CR/DR suffix
+  if (/\b(Bendigo|Adelaide\s*Bank)\b/i.test(text)) return true;
   if (/\$\s*[\d,]+\.\d{2}\s*(?:CR|DR)/i.test(text) && /\b(AUS|VIC|NSW|QLD)\b/.test(text)) return true;
   return false;
 }
@@ -318,6 +317,7 @@ function parseAustralian(text: string): Transaction[] {
   const isCommBank = /\b(CommBank|Commonwealth|NetBank)\b/i.test(text);
   const isANZ = /\bANZ\b/.test(text) && /\bblank\b/.test(text);
   const isNAB = /\bNational\s*Australia\s*Bank\b/i.test(text) || (/\bNAB\b/.test(text) && /Cr\s*$/.test(text));
+  const isBendigo = /\b(Bendigo|Adelaide\s*Bank)\b/i.test(text);
 
   // --- NAB preprocessing: insert spaces in spaceless text ---
   if (isNAB) {
@@ -408,7 +408,40 @@ function parseAustralian(text: string): Transaction[] {
     let balance = "";
     let cleanDesc = rest;
 
-    if (isCommBank) {
+    if (isBendigo) {
+      // Bendigo: "DESC RETAIL PURCHASE DD/MM CARD NUMBER xxx AMOUNT BALANCE"
+      // or "DESC RETAIL PURCHASE RETURN DD/MM CARD NUMBER xxx AMOUNT BALANCE"
+      // Amounts are concatenated: "16.136,017.88" = 16.13 + 6,017.88
+      const isReturn = /RETAIL PURCHASE RETURN|REFUND|CREDIT/i.test(rest);
+      const isPayment = /PAYMENT\s*-?\s*THANK/i.test(rest) || /^PAYMENT\b/i.test(rest);
+
+      // Extract amounts from the full line (extractAmounts handles concatenation)
+      const amounts = extractAmounts(rest);
+      if (amounts.length >= 2) {
+        const txnAmt = amounts[amounts.length - 2];
+        const bal = amounts[amounts.length - 1];
+        balance = bal.toFixed(2);
+        if (isReturn || isPayment) {
+          deposit = txnAmt.toFixed(2);
+        } else {
+          withdrawal = txnAmt.toFixed(2);
+        }
+      } else if (amounts.length === 1) {
+        if (isReturn || isPayment) deposit = amounts[0].toFixed(2);
+        else withdrawal = amounts[0].toFixed(2);
+      }
+
+      // Clean description: remove amounts, card info, purchase type
+      cleanDesc = rest
+        .replace(/[\d,]+\.\d{2}/g, "")
+        .replace(/RETAIL PURCHASE\s*(RETURN)?/gi, "")
+        .replace(/CARD NUMBER\s*\d+[X\*]+\d*/gi, "")
+        .replace(/\d{2}\/\d{2}/g, "")  // effective date DD/MM
+        .replace(/AUS\s*$/i, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    } else if (isCommBank) {
       // CommBank: "desc amount$$balanceCR" or "desc$credit$balanceCR"
       const balMatch = rest.match(/\$([\d,]+\.\d{2})(?:CR|DR)\s*$/i);
       if (balMatch) {
