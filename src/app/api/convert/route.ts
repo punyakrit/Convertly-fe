@@ -142,8 +142,14 @@ export async function POST(req: NextRequest) {
       data: { id: convId, fileName: resultFileName, convertedUrl, originalUrl },
     });
   } catch (error) {
+    console.error("=== CONVERSION ERROR ===");
+    console.error("Error:", error);
+    if (error instanceof Error) {
+      console.error("Message:", error.message);
+      console.error("Stack:", error.stack);
+    }
+    console.error("========================");
     const message = error instanceof Error ? error.message : "Conversion failed";
-    console.error("Conversion error:", message);
     return NextResponse.json({ success: false, error: message }, { status: 500 });
   }
 }
