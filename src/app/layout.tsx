@@ -1,7 +1,8 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import "./globals.css";
-import { Sidebar, MobileNav } from "@/components/Sidebar";
+import { Navbar, Footer } from "@/components/Navbar";
+import { UserProvider } from "@/components/UserProvider";
 
 const inter = Inter({
   variable: "--font-geist-sans",
@@ -9,8 +10,8 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "Convertly - File Conversion Tools",
-  description: "Professional file conversion tools. Convert PDFs, images, bank statements and more.",
+  title: "Convertly - Convert Files Instantly",
+  description: "Fast, secure, and free file conversion. PDF, Image, CSV & More.",
 };
 
 export default function RootLayout({
@@ -20,12 +21,12 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className={`${inter.variable} h-full antialiased`}>
-      <body className="min-h-full flex">
-        <Sidebar />
-        <main className="flex-1 min-h-screen pb-20 lg:pb-0">
-          {children}
-        </main>
-        <MobileNav />
+      <body className="min-h-full flex flex-col font-sans">
+        <UserProvider>
+          <Navbar />
+          <main className="flex-1">{children}</main>
+          <Footer />
+        </UserProvider>
       </body>
     </html>
   );

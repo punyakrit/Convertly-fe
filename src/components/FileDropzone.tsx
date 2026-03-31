@@ -30,26 +30,26 @@ export function FileDropzone({ files, onFilesSelected, onRemoveFile, accept, mul
   if (files.length > 0) {
     return (
       <div className="space-y-3">
-        <div className="bg-white border border-slate-200 rounded-2xl divide-y divide-slate-100">
+        <div className="bg-white border border-gray-200 rounded-2xl divide-y divide-gray-100">
           {files.map((file, i) => (
-            <div key={`${file.name}-${i}`} className="flex items-center gap-3 px-4 py-3">
-              <div className="w-9 h-9 rounded-lg bg-blue-50 flex items-center justify-center">
+            <div key={`${file.name}-${i}`} className="flex items-center gap-3 px-5 py-3.5">
+              <div className="w-10 h-10 rounded-xl bg-indigo-50 flex items-center justify-center">
                 {file.type.startsWith("image/") ? (
-                  <ImageIcon className="w-4 h-4 text-blue-600" />
+                  <ImageIcon className="w-4 h-4 text-indigo-600" />
                 ) : (
-                  <FileText className="w-4 h-4 text-blue-600" />
+                  <FileText className="w-4 h-4 text-indigo-600" />
                 )}
               </div>
               <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium text-slate-800 truncate">{file.name}</p>
-                <p className="text-xs text-slate-400">{formatFileSize(file.size)}</p>
+                <p className="text-sm font-medium text-gray-900 truncate">{file.name}</p>
+                <p className="text-xs text-gray-400">{formatFileSize(file.size)}</p>
               </div>
               <CheckCircle2 className="w-4 h-4 text-green-500 shrink-0" />
               <button
                 onClick={() => onRemoveFile(i)}
-                className="p-1 hover:bg-slate-100 rounded-lg transition-colors"
+                className="p-1.5 hover:bg-gray-100 rounded-lg transition-colors"
               >
-                <X className="w-4 h-4 text-slate-400" />
+                <X className="w-4 h-4 text-gray-400" />
               </button>
             </div>
           ))}
@@ -57,7 +57,7 @@ export function FileDropzone({ files, onFilesSelected, onRemoveFile, accept, mul
         {multiple && (
           <div {...getRootProps()}>
             <input {...getInputProps()} />
-            <button className="w-full py-2.5 text-sm font-medium text-blue-600 bg-blue-50 rounded-xl hover:bg-blue-100 transition-colors">
+            <button className="w-full py-2.5 text-sm font-medium text-indigo-600 bg-indigo-50 rounded-xl hover:bg-indigo-100 transition-colors">
               + Add more files
             </button>
           </div>
@@ -69,26 +69,26 @@ export function FileDropzone({ files, onFilesSelected, onRemoveFile, accept, mul
   return (
     <div
       {...getRootProps()}
-      className={`border-2 border-dashed rounded-2xl p-10 text-center cursor-pointer transition-all ${
+      className={`border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer transition-all ${
         isDragActive
-          ? "border-blue-500 bg-blue-50"
-          : "border-slate-300 bg-slate-50 hover:border-blue-400 hover:bg-blue-50/50"
+          ? "border-indigo-500 bg-indigo-50"
+          : "border-gray-300 bg-gray-50 hover:border-indigo-400 hover:bg-indigo-50/30"
       }`}
     >
       <input {...getInputProps()} />
       <div className="flex flex-col items-center gap-3">
         <div
           className={`w-14 h-14 rounded-2xl flex items-center justify-center transition-colors ${
-            isDragActive ? "bg-blue-100" : "bg-white border border-slate-200"
+            isDragActive ? "bg-indigo-100" : "bg-white border border-gray-200"
           }`}
         >
-          <Upload className={`w-6 h-6 ${isDragActive ? "text-blue-600" : "text-slate-400"}`} />
+          <Upload className={`w-6 h-6 ${isDragActive ? "text-indigo-600" : "text-gray-400"}`} />
         </div>
         <div>
-          <p className="text-sm font-medium text-slate-700">
-            {isDragActive ? "Drop files here" : "Drag & drop files here"}
+          <p className="text-base font-semibold text-gray-700">
+            {isDragActive ? "Drop your files here" : "Drop your PDF here"}
           </p>
-          <p className="text-xs text-slate-400 mt-1">or click to browse</p>
+          <p className="text-sm text-gray-400 mt-1">or click to browse from your computer</p>
         </div>
       </div>
     </div>

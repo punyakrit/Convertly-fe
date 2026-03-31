@@ -18,12 +18,12 @@ export function getTimeAgo(date: Date): string {
 
 export function getOutputLabel(inputType: string): string {
   const labels: Record<string, string> = {
-    "image-to-pdf": "IMG → PDF",
-    "pdf-to-image": "PDF → IMG",
+    "image-to-pdf": "IMG \u2192 PDF",
+    "pdf-to-image": "PDF \u2192 IMG",
     "merge-pdf": "MERGE",
     "split-pdf": "SPLIT",
-    "pdf-to-csv": "PDF → CSV",
-    "bank-statement-to-csv": "BANK → CSV",
+    "pdf-to-csv": "PDF \u2192 CSV",
+    "bank-statement-to-csv": "BANK \u2192 CSV",
   };
   return labels[inputType] || inputType;
 }
@@ -39,12 +39,24 @@ export function generateOutputName(original: string, outputExt: string): string 
   return `${sanitizeFilename(baseName)}_${timestamp}${outputExt}`;
 }
 
-export function getUserId(): string {
+/** Device ID — stable per browser, used for registration */
+export function getDeviceId(): string {
   if (typeof window === "undefined") return "";
-  let id = localStorage.getItem("convertly_user_id");
+  let id = localStorage.getItem("convertly_device_id");
   if (!id) {
     id = crypto.randomUUID();
-    localStorage.setItem("convertly_user_id", id);
+    localStorage.setItem("convertly_device_id", id);
   }
   return id;
+}
+
+/** Supabase user ID — set after registration, used for all API calls */
+export function getUserId(): string {
+  if (typeof window === "undefined") return "";
+  return localStorage.getItem("convertly_user_id") || "";
+}
+
+export function setUserId(id: string): void {
+  if (typeof window === "undefined") return;
+  localStorage.setItem("convertly_user_id", id);
 }

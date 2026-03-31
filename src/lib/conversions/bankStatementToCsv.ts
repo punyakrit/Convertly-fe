@@ -165,19 +165,33 @@ function parseTransactions(text: string): Transaction[] {
     stitched.push(line);
   }
 
-  let prevBalance = 0;
+  // --- Find opening balance ---
+  let prevBalance = -1;
+  const balancePatterns = [
+    /(?:opening\s*balance|balance\s*(?:b\/f|brought\s*forward))[:\s]*([\d,]+\.\d{2})/i,
+    /(?:balance\s*as\s*on)[:\s]*([\d,]+\.\d{2})/i,
+    /(?:o\/b|ob)[:\s]*([\d,]+\.\d{2})/i,
+  ];
   for (const line of stitched) {
-    const m = line.match(
-      /(?:opening\s*balance|balance\s*(?:b\/f|brought\s*forward))[:\s]*([\d,]+\.\d{2})/i
-    );
-    if (m) {
-      prevBalance = parseFloat(m[1].replace(/,/g, ""));
-      break;
+    for (const pat of balancePatterns) {
+      const m = pat.exec(line);
+      if (m) {
+        prevBalance = parseFloat(m[1].replace(/,/g, ""));
+        break;
+      }
     }
+    if (prevBalance >= 0) break;
   }
 
   const lines = stitched.map((l) => l.trim()).filter((l) => l && !isJunkLine(l));
-  const transactions: Transaction[] = [];
+
+  // --- First pass: collect raw transaction data with all amounts ---
+  interface RawTxn {
+    date: string;
+    descParts: string[];
+    amounts: number[];
+  }
+  const rawTxns: RawTxn[] = [];
   let i = 0;
 
   while (i < lines.length) {
@@ -221,17 +235,118 @@ function parseTransactions(text: string): Transaction[] {
     }
 
     const amounts = extractAmounts(amountText);
+    if (date && (amounts.length > 0 || descParts.length > 0)) {
+      rawTxns.push({ date, descParts, amounts });
+    }
+    i = j;
+  }
+
+  // --- If we didn't find opening balance, infer from first transaction ---
+  // Look at the first transaction with 2+ amounts: balance is last amount
+  // prevBalance = balance +/- txnAmount
+  if (prevBalance < 0 && rawTxns.length > 0) {
+    for (const rt of rawTxns) {
+      if (rt.amounts.length >= 2) {
+        const bal = rt.amounts[rt.amounts.length - 1];
+        const txn = rt.amounts[rt.amounts.length - 2];
+        // We don't know direction yet; try both and pick the positive one
+        const asDebit = bal + txn;
+        const asCredit = bal - txn;
+        prevBalance = asDebit > 0 ? asDebit : (asCredit > 0 ? asCredit : 0);
+        break;
+      }
+    }
+    if (prevBalance < 0) prevBalance = 0;
+  }
+
+  // --- Second pass: assign debit/credit using balance math ---
+  const transactions: Transaction[] = [];
+
+  for (const rt of rawTxns) {
+    const { date, descParts, amounts } = rt;
     let withdrawal = "";
     let deposit = "";
     let balance = "";
 
-    if (amounts.length >= 2) {
+    if (amounts.length >= 3) {
+      // Likely: [debit, credit, balance] or [credit, debit, balance]
       const bal = amounts[amounts.length - 1];
-      const txn = amounts[amounts.length - 2];
       balance = bal.toFixed(2);
-      if (bal > prevBalance) deposit = txn.toFixed(2);
-      else withdrawal = txn.toFixed(2);
+
+      // Use actual balance difference to determine debit/credit
+      if (prevBalance >= 0) {
+        const diff = bal - prevBalance;
+        const absDiff = Math.abs(diff);
+        // Find which of the earlier amounts matches the difference
+        let matched = false;
+        for (let a = amounts.length - 2; a >= 0; a--) {
+          if (Math.abs(amounts[a] - absDiff) < 0.01) {
+            if (diff > 0) deposit = amounts[a].toFixed(2);
+            else withdrawal = amounts[a].toFixed(2);
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) {
+          // Fallback: use the non-zero amounts before balance
+          const txnAmounts = amounts.slice(0, amounts.length - 1).filter(a => a > 0);
+          if (txnAmounts.length === 1) {
+            if (diff > 0) deposit = txnAmounts[0].toFixed(2);
+            else withdrawal = txnAmounts[0].toFixed(2);
+          } else if (txnAmounts.length >= 2) {
+            // Two non-zero amounts before balance - first is usually debit, second credit
+            withdrawal = txnAmounts[0].toFixed(2);
+            deposit = txnAmounts[1].toFixed(2);
+          }
+        }
+      } else {
+        // No prevBalance context - use positional heuristic
+        withdrawal = amounts[0] > 0 ? amounts[0].toFixed(2) : "";
+        deposit = amounts[1] > 0 ? amounts[1].toFixed(2) : "";
+      }
       prevBalance = bal;
+
+    } else if (amounts.length === 2) {
+      const bal = amounts[1];
+      const txn = amounts[0];
+      balance = bal.toFixed(2);
+
+      if (prevBalance >= 0) {
+        // Use actual balance difference - this is the ground truth
+        const diff = bal - prevBalance;
+        const absDiff = Math.abs(diff);
+
+        // Verify the transaction amount matches the balance change
+        if (Math.abs(txn - absDiff) < 0.01) {
+          // Transaction matches balance change exactly
+          if (diff > 0) deposit = txn.toFixed(2);
+          else withdrawal = txn.toFixed(2);
+        } else {
+          // Transaction amount doesn't match balance change
+          // Trust the balance column - derive the actual amount from balance diff
+          if (diff > 0) deposit = absDiff.toFixed(2);
+          else if (diff < 0) withdrawal = absDiff.toFixed(2);
+          else {
+            // Balance unchanged - use keyword heuristic
+            const desc = buildDescription(descParts).toLowerCase();
+            if (/salary|credit|refund|cashback|interest|reward|received|deposit/i.test(desc)) {
+              deposit = txn.toFixed(2);
+            } else {
+              withdrawal = txn.toFixed(2);
+            }
+          }
+        }
+      } else {
+        // No prevBalance - use keyword heuristic
+        const desc = buildDescription(descParts).toLowerCase();
+        if (/salary|credit|refund|cashback|interest|reward|received|deposit|inft|inf\//i.test(desc)) {
+          deposit = txn.toFixed(2);
+        } else {
+          withdrawal = txn.toFixed(2);
+        }
+      }
+      prevBalance = bal;
+
     } else if (amounts.length === 1) {
       const desc = buildDescription(descParts).toLowerCase();
       if (/salary|credit|refund|cashback|interest|reward|received|deposit|inft|inf\/|rtgs.*credit/i.test(desc)) {
@@ -245,7 +360,6 @@ function parseTransactions(text: string): Transaction[] {
     if (date && (withdrawal || deposit || description)) {
       transactions.push({ date, description: description || "N/A", withdrawal, deposit, balance });
     }
-    i = j;
   }
 
   return transactions;
@@ -259,7 +373,7 @@ export async function bankStatementToCsv(
   let text = data.text;
 
   if (text.trim().length < 50) {
-    throw new Error("Could not extract text from this PDF. It may be a scanned image — try a text-based statement.");
+    throw new Error("Could not extract text from this PDF. It may be a scanned image - try a text-based statement.");
   }
 
   const transactions = parseTransactions(text);
@@ -278,19 +392,9 @@ export async function bankStatementToCsv(
     Balance: t.balance,
   }));
 
-  const totalDebit = transactions.reduce((s, t) => s + parseFloat(t.withdrawal || "0"), 0);
-  const totalCredit = transactions.reduce((s, t) => s + parseFloat(t.deposit || "0"), 0);
-
   const fields = ["Date", "Payee", "Description", "Category", "Debit", "Credit", "Balance"];
   const parser = new Parser({ fields });
-  let csv = parser.parse(rows);
-
-  csv += "\n";
-  csv += `\n"","","","","SUMMARY","",""`;
-  csv += `\n"","","","","Total Transactions","${transactions.length}",""`;
-  csv += `\n"","","","","Total Debits","${totalDebit.toFixed(2)}",""`;
-  csv += `\n"","","","","Total Credits","","${totalCredit.toFixed(2)}"`;
-  csv += `\n"","","","","Net Flow","${(totalCredit - totalDebit).toFixed(2)}",""`;
+  const csv = parser.parse(rows);
 
   return {
     fileName: generateOutputName(originalName, "_bank_statement.csv"),

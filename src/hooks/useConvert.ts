@@ -34,9 +34,14 @@ export function useConvert(toolId: ConversionType) {
       setError(null);
 
       try {
+        const userId = getUserId();
+        if (!userId) {
+          throw new Error("User not registered yet. Please refresh the page and try again.");
+        }
+
         const formData = new FormData();
         formData.append("type", toolId);
-        formData.append("user_id", getUserId());
+        formData.append("user_id", userId);
 
         const multiFileTypes: ConversionType[] = ["image-to-pdf", "merge-pdf"];
         if (multiFileTypes.includes(toolId)) {
