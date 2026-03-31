@@ -1,6 +1,7 @@
+// pdf-parse's index.js loads a test PDF on require() which breaks on Vercel.
 async function parsePdf(buffer: Buffer): Promise<{ text: string }> {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const pdfParse = require("pdf-parse");
+  const pdfParse = require("pdf-parse/lib/pdf-parse.js");
   return pdfParse(buffer);
 }
 import { Parser } from "json2csv";

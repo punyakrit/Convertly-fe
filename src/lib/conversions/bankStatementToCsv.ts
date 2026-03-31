@@ -1,7 +1,8 @@
-// pdf-parse v1 tries to load a test file on require(), so we lazy-import it
+// pdf-parse's index.js loads a test PDF on require() which breaks on Vercel.
+// Import the internal lib directly to skip that.
 async function parsePdf(buffer: Buffer): Promise<{ text: string }> {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const pdfParse = require("pdf-parse");
+  const pdfParse = require("pdf-parse/lib/pdf-parse.js");
   return pdfParse(buffer);
 }
 import { Parser } from "json2csv";
