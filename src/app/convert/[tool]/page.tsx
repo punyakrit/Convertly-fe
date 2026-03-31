@@ -5,11 +5,12 @@ import { useState } from "react";
 import Link from "next/link";
 import {
   ArrowLeft, AlertCircle, CheckCircle2, Download, Loader2,
-  RefreshCw, Shield, FileText, Lock, GitMerge, Trash2
+  RefreshCw, Shield, FileText, Lock, GitMerge, Trash2, Eye
 } from "lucide-react";
 import { getToolById } from "@/lib/tools";
 import { useConvert } from "@/hooks/useConvert";
 import { FileDropzone } from "@/components/FileDropzone";
+import { CsvPreviewModal } from "@/components/CsvPreviewModal";
 import type { ConversionType } from "@/lib/types";
 
 const HEADLINES: Record<string, { title: string; sub: string }> = {
@@ -21,6 +22,8 @@ const HEADLINES: Record<string, { title: string; sub: string }> = {
   "bank-statement-to-csv": { title: "PDF to CSV Converter", sub: "Convert PDF tables into CSV instantly" },
 };
 
+const CSV_TOOLS = ["pdf-to-csv", "bank-statement-to-csv"];
+
 export default function ConvertPage() {
   const params = useParams();
   const toolId = params.tool as string;
@@ -28,6 +31,7 @@ export default function ConvertPage() {
   const { state, files, progress, result, error, addFiles, removeFile, convert, reset } =
     useConvert(toolId as ConversionType);
   const [pageRange, setPageRange] = useState("");
+  const [showPreview, setShowPreview] = useState(false);
 
   if (!tool) {
     return (
@@ -41,6 +45,7 @@ export default function ConvertPage() {
   tool.acceptedTypes.forEach((mime) => { acceptMap[mime] = []; });
 
   const headline = HEADLINES[toolId] || { title: tool.title, sub: tool.description };
+  const isCsvTool = CSV_TOOLS.includes(toolId);
 
   const handleConvert = () => {
     const options: Record<string, string> = {};
@@ -50,6 +55,16 @@ export default function ConvertPage() {
 
   return (
     <div className="bg-white min-h-[calc(100vh-56px)] sm:min-h-[calc(100vh-64px)]">
+      {/* CSV Preview Modal */}
+      {result && isCsvTool && (
+        <CsvPreviewModal
+          open={showPreview}
+          onClose={() => setShowPreview(false)}
+          csvUrl={result.convertedUrl}
+          fileName={result.fileName}
+        />
+      )}
+
       <div className="max-w-6xl mx-auto px-4 sm:px-5 py-6 sm:py-12">
         <Link href="/" className="inline-flex items-center gap-1.5 text-sm text-gray-400 hover:text-gray-600 transition-colors mb-5 sm:mb-8">
           <ArrowLeft className="w-4 h-4" /> Back
@@ -168,18 +183,30 @@ export default function ConvertPage() {
                     <FileText className="w-5 h-5 text-indigo-600 shrink-0" />
                     <div className="min-w-0">
                       <p className="text-sm font-medium text-gray-900 truncate">{result.fileName}</p>
-                      <p className="text-xs text-gray-400">CSV Format</p>
+                      <p className="text-xs text-gray-400">{isCsvTool ? "CSV Format" : "PDF Format"}</p>
                     </div>
                   </div>
                 </div>
-                <a
-                  href={result.convertedUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="mt-4 w-full py-3 bg-indigo-600 text-white text-sm font-semibold rounded-xl hover:bg-indigo-700 transition-colors flex items-center justify-center gap-2"
-                >
-                  <Download className="w-4 h-4" /> Download CSV
-                </a>
+
+                {/* Action buttons */}
+                <div className="mt-4 space-y-2">
+                  {isCsvTool && (
+                    <button
+                      onClick={() => setShowPreview(true)}
+                      className="w-full py-3 bg-white border-2 border-indigo-300 text-indigo-700 text-sm font-semibold rounded-xl hover:bg-indigo-100 transition-colors flex items-center justify-center gap-2"
+                    >
+                      <Eye className="w-4 h-4" /> View CSV
+                    </button>
+                  )}
+                  <a
+                    href={result.convertedUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full py-3 bg-indigo-600 text-white text-sm font-semibold rounded-xl hover:bg-indigo-700 transition-colors flex items-center justify-center gap-2"
+                  >
+                    <Download className="w-4 h-4" /> Download {isCsvTool ? "CSV" : "File"}
+                  </a>
+                </div>
               </div>
             )}
 
@@ -201,7 +228,7 @@ export default function ConvertPage() {
               <div className="bg-gray-50 border border-gray-200 rounded-2xl p-5">
                 <h3 className="text-sm font-semibold text-gray-800 mb-3">How it works</h3>
                 <ol className="space-y-2.5 text-sm text-gray-500">
-                  {["Upload your PDF file", "Click Convert to process", "Download your result"].map((s, i) => (
+                  {["Upload your PDF file", "Click Convert to process", "Preview or download your result"].map((s, i) => (
                     <li key={i} className="flex gap-3">
                       <span className="w-5 h-5 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center text-[10px] font-bold shrink-0">{i + 1}</span>
                       {s}
