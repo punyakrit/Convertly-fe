@@ -248,55 +248,6 @@ function categorize(desc: string): string {
   return "Other";
 }
 
-// ====================================================================
-// PAYEE EXTRACTION
-// ====================================================================
-
-function extractPayee(desc: string): string {
-  // HDFC: UPI-NAME-VPA-...
-  const hdfc = desc.match(/^UPI[-\/]([^-\/]{2,})/i);
-  if (hdfc) return hdfc[1].trim().substring(0, 50);
-  // UPI/CR/REF/NAME or UPI/P2A/REF/NAME
-  const upiSub = desc.match(/UPI\/(?:CR|DR|P2A|P2M)\/\d+\/([^\/]+)/i);
-  if (upiSub) return upiSub[1].trim().substring(0, 50);
-  // UPI/REF/desc/VPA
-  const upiRef = desc.match(/UPI\/\d+\/([^\/]+)/i);
-  if (upiRef) return upiRef[1].trim().substring(0, 50);
-  // UPI/NAME (generic)
-  const upiGen = desc.match(/UPI\/([^\/]{2,})/i);
-  if (upiGen) return upiGen[1].trim().substring(0, 50);
-  // NEFT: NEFT CR-IFSC-NAME or NEFT-UTR-NAME
-  const neftIfsc = desc.match(/NEFT\s*(?:CR|DR)?[-\/]([A-Z]{4}[A-Z0-9]+)[-\/]([^-\/]+)/i);
-  if (neftIfsc) return neftIfsc[2].trim().substring(0, 50);
-  const neft = desc.match(/NEFT[-\/]([^-\/]{2,})/i);
-  if (neft) return neft[1].trim().substring(0, 50);
-  // RTGS: RTGS-UTR-NAME
-  const rtgs = desc.match(/RTGS[-\/]([A-Z0-9]+)[-\/]([^-\/]+)/i);
-  if (rtgs) return rtgs[2].trim().substring(0, 50);
-  // IMPS/MMT: MMT/IMPS/REF/NAME or IMPS-REF-NAME
-  const mmt = desc.match(/(?:MMT\/IMPS|IMPS)[-\/]\d+[-\/]([^-\/]+)/i);
-  if (mmt) return mmt[1].trim().substring(0, 50);
-  // INFT: INFT/X/NAME or INF/INFT/REF/NAME
-  const inft = desc.match(/(?:INF\/INFT|INFT|IFT)\/\d+\/([^\/]+)/i);
-  if (inft) return inft[1].trim().substring(0, 50);
-  // CLG: CLG/NAME
-  const clg = desc.match(/CLG\/([^\/]+)/i);
-  if (clg) return clg[1].trim().substring(0, 50);
-  // TRF/NAME
-  const trf = desc.match(/TRF\/([^\/]+)/i);
-  if (trf) return trf[1].trim().substring(0, 50);
-  // Union Bank: BY/TO TRANSFER
-  const union = desc.match(/(?:BY|TO)\s+TRANSFER[-\s]+(.+)/i);
-  if (union) return union[1].trim().substring(0, 50);
-  // Direct Debit/Credit: "Direct Debit 503543 LEAPTEL" → "LEAPTEL"
-  const directDebit = desc.match(/Direct\s+(?:Debit|Credit)\s+\d*\s*(.+)/i);
-  if (directDebit) return directDebit[1].trim().substring(0, 50);
-  // Merchant name with location: "ALDI STORES, TARNEIT" → "ALDI STORES"
-  const merchantComma = desc.match(/^([^,]+),/);
-  if (merchantComma && merchantComma[1].length > 2) return merchantComma[1].trim().substring(0, 50);
-  // Fallback: clean and return first meaningful part
-  return desc.replace(/\b[A-Z]{4}0\d{6}\b/g, "").replace(/\b\d{10,}\b/g, "").trim().substring(0, 50);
-}
 
 // ====================================================================
 // COMMBANK / AUSTRALIAN BANK PARSER
@@ -338,14 +289,25 @@ function parseAustralian(text: string): Transaction[] {
 
   const lines = text.split("\n");
 
-  // --- Extract statement year ---
+  // --- Extract statement year(s) ---
+  // For cross-year statements (e.g. Oct 2024 - Jan 2025), track both start and end years
   let statementYear = new Date().getFullYear();
+  let statementEndYear = statementYear;
+  let startMonth = 1; // month number of statement start (1-12)
   for (const line of lines) {
     // "Period18 Oct 2024 - 17 Jan 2025" or "28 NOVEMBER 2025 TO 31 DECEMBER 2025"
+    const periodMatch = line.match(/(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s*(\d{4})\s*(?:to|-)\s*(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s*(\d{4})/i);
+    if (periodMatch) {
+      statementYear = parseInt(periodMatch[3]);
+      statementEndYear = parseInt(periodMatch[6]);
+      const sm = MONTH_NUM[periodMatch[2].substring(0, 3).toLowerCase()];
+      if (sm) startMonth = parseInt(sm);
+      break;
+    }
     const ym = line.match(/(\d{4})\s*(?:to|-)\s*\d/i);
-    if (ym) { statementYear = parseInt(ym[1]); break; }
+    if (ym) { statementYear = parseInt(ym[1]); statementEndYear = statementYear; break; }
     const ym2 = line.match(/(?:period|starts?|ends?)\s*.*?(\d{4})/i);
-    if (ym2) { statementYear = parseInt(ym2[1]); break; }
+    if (ym2) { statementYear = parseInt(ym2[1]); statementEndYear = statementYear; break; }
   }
 
   // Match "DD Mon" optionally followed by "YY" or "YYYY" (Bendigo: "10 Sep 25", CommBank: "18 Oct2024")
@@ -372,7 +334,9 @@ function parseAustralian(text: string): Transaction[] {
     if (/^page\s+\d+\s+of\s+\d+$/i.test(t)) return false;
     if (/^withdrawals\s*\(\$\)|^deposits\s*\(\$\)|^balance\s*\(\$\)/i.test(t)) return false;
     if (/australia\s+and\s+new\s+zealand\s+banking/i.test(t)) return false;
-    if (/transaction\s*totals|closing\s*balance/i.test(t)) return false;
+    if (/transaction\s*(totals|summary)/i.test(t)) return false;
+    if (/closing\s*balance/i.test(t)) return false;
+    if (/^transaction\s*type\s*$/i.test(t)) return false;
     if (/bendigo\s+and\s+adelaide/i.test(t)) return false;
     if (/platinum\s*rewards/i.test(t)) return false;
     if (/credit\s*limit|available\s*credit|annual\s*(purchase|cash)/i.test(t)) return false;
@@ -397,6 +361,18 @@ function parseAustralian(text: string): Transaction[] {
   }
 
   const transactions: Transaction[] = [];
+  let prevBalance = -1;
+
+  // Extract opening balance for CommBank
+  if (isCommBank) {
+    for (const line of merged) {
+      if (/opening\s*balance/i.test(line)) {
+        const obMatch = line.match(/\$([\d,]+\.\d{2})\s*(?:CR|DR)/i);
+        if (obMatch) { prevBalance = parseFloat(obMatch[1].replace(/,/g, "")); }
+        break;
+      }
+    }
+  }
 
   for (const line of merged) {
     const dateMatch = txnDateRe.exec(line);
@@ -416,6 +392,12 @@ function parseAustralian(text: string): Transaction[] {
       if (yearMatch) {
         year = yearMatch[1];
         rest = rest.substring(yearMatch[0].length);
+      } else if (statementEndYear > statementYear) {
+        // Cross-year statement: use endYear for months before the start month
+        const txnMonth = parseInt(MONTH_NUM[month.substring(0, 3).toLowerCase()] || "0");
+        if (txnMonth > 0 && txnMonth < startMonth) {
+          year = statementEndYear.toString();
+        }
       }
     }
 
@@ -424,6 +406,8 @@ function parseAustralian(text: string): Transaction[] {
     // Skip balance/totals/fee/summary lines
     if (/opening\s*balance|closing\s*balance|brought\s*forward/i.test(rest)) continue;
     if (/transaction\s*(totals|summary|type)/i.test(rest)) continue;
+    // Skip bare date-only entries or trivial "to" lines from summary tables
+    if (!rest || /^to\b/i.test(rest.trim())) continue;
     if (/^(free|chargeable|unit\s*price|fee\s*charged|staff\s*assisted|cheques\s*written|total\s|account\s*fee)/i.test(rest)) continue;
     if (/opening\s*balance.*total\s*debits/i.test(rest)) continue;
 
@@ -490,26 +474,47 @@ function parseAustralian(text: string): Transaction[] {
         amountStr = amountStr.substring(0, amountStr.lastIndexOf(balMatch[0]));
       }
 
-      // Debit pattern: "amount$$" (empty credit between double dollar)
-      const debitMatch = amountStr.match(/([\d,]+\.\d{2})\$\$\s*$/);
-      if (debitMatch) {
-        withdrawal = parseFloat(debitMatch[1].replace(/,/g, "")).toFixed(2);
+      // Detect debit vs credit from the ORIGINAL rest string (before balance removal consumed a $)
+      // Debit format: "amount$$balanceCR" → $$ means empty credit column
+      // Credit format: "$amount$balanceCR" → $ before amount, $ between amount and balance
+      const hasDollarDollar = /\d\.\d{2}\$\$/.test(rest);
+      const hasCreditPattern = /\$[\d,]+\.\d{2}\$[\d,]+\.\d{2}/.test(rest);
+
+      if (hasDollarDollar) {
+        // Debit: extract amount just before "$$" from the original rest
+        const ddMatch = rest.match(/([\d,]+\.\d{2})\$\$/);
+        if (ddMatch) {
+          withdrawal = parseFloat(ddMatch[1].replace(/,/g, "")).toFixed(2);
+        }
+      } else if (hasCreditPattern) {
+        // Credit: extract amount between $ signs from original rest
+        const crMatch = rest.match(/\$([\d,]+\.\d{2})\$/);
+        if (crMatch) {
+          deposit = parseFloat(crMatch[1].replace(/,/g, "")).toFixed(2);
+        }
       } else {
-        // Credit pattern: "$amount$" at end
-        const creditMatch = amountStr.match(/\$([\d,]+\.\d{2})\$\s*$/);
-        if (creditMatch) {
-          deposit = parseFloat(creditMatch[1].replace(/,/g, "")).toFixed(2);
-        } else {
-          // Single amount at end
-          const singleMatch = amountStr.match(/([\d,]+\.\d{2})\$?\s*$/);
-          if (singleMatch) {
-            const before = amountStr.substring(0, amountStr.lastIndexOf(singleMatch[0]));
-            if (before.trimEnd().endsWith("$")) {
-              deposit = parseFloat(singleMatch[1].replace(/,/g, "")).toFixed(2);
-            } else {
-              withdrawal = parseFloat(singleMatch[1].replace(/,/g, "")).toFixed(2);
-            }
+        // Fallback: single amount at end of amountStr
+        const singleMatch = amountStr.match(/([\d,]+\.\d{2})\$?\s*$/);
+        if (singleMatch) {
+          const before = amountStr.substring(0, amountStr.lastIndexOf(singleMatch[0]));
+          if (before.trimEnd().endsWith("$")) {
+            deposit = parseFloat(singleMatch[1].replace(/,/g, "")).toFixed(2);
+          } else {
+            withdrawal = parseFloat(singleMatch[1].replace(/,/g, "")).toFixed(2);
           }
+        }
+      }
+
+      // Validate amount against balance delta — fixes glued ref+amount (e.g. "INV-109419279.95$$")
+      if (balance && prevBalance >= 0) {
+        const bal = parseFloat(balance);
+        const delta = bal - prevBalance;
+        const absDelta = Math.abs(delta);
+        const extractedAmt = parseFloat(withdrawal || deposit || "0");
+        if (extractedAmt > 0 && Math.abs(extractedAmt - absDelta) > 0.02) {
+          // Extracted amount doesn't match balance change — recompute from delta
+          if (delta > 0.01) { withdrawal = ""; deposit = absDelta.toFixed(2); }
+          else if (delta < -0.01) { deposit = ""; withdrawal = absDelta.toFixed(2); }
         }
       }
 
@@ -598,6 +603,7 @@ function parseAustralian(text: string): Transaction[] {
 
     if (dateStr && (withdrawal || deposit || cleanDesc)) {
       transactions.push({ date: dateStr, description: cleanDesc || "N/A", withdrawal, deposit, balance });
+      if (balance) prevBalance = parseFloat(balance);
     }
   }
 
@@ -865,7 +871,6 @@ export async function bankStatementToCsv(
 
   const rows = transactions.map((t) => ({
     Date: t.date,
-    Payee: extractPayee(t.description),
     Description: t.description,
     Category: categorize(t.description),
     Debit: t.withdrawal,
@@ -873,7 +878,7 @@ export async function bankStatementToCsv(
     Balance: t.balance,
   }));
 
-  const fields = ["Date", "Payee", "Description", "Category", "Debit", "Credit", "Balance"];
+  const fields = ["Date", "Description", "Category", "Debit", "Credit", "Balance"];
   const parser = new Parser({ fields });
   const csv = parser.parse(rows);
 

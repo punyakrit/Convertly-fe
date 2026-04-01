@@ -19,7 +19,7 @@ const TOOLS = [
 const BANK_FEATURES = [
   { icon: Table, title: "Auto Column Detection", desc: "Identifies Date, Description, Debit, Credit, and Balance columns automatically." },
   { icon: Tag, title: "Smart Categorization", desc: "Classifies transactions as UPI, NEFT, IMPS, ATM, Salary, EMI, and 10+ categories." },
-  { icon: Users, title: "Payee Extraction", desc: "Pulls merchant and payee names from narration text." },
+  { icon: Users, title: "Transaction Details", desc: "Extracts full transaction descriptions with merchant and reference details." },
   { icon: TrendingUp, title: "Running Balance", desc: "Tracks running balance for accurate debit/credit assignment." },
   { icon: Shield, title: "Multi-Bank Support", desc: "Works with SBI, HDFC, ICICI, Axis, PNB, Kotak, and more." },
   { icon: Clock, title: "Instant Processing", desc: "Handles 600+ row statements in seconds, no limits." },
@@ -124,7 +124,7 @@ export default function HomePage() {
               </p>
 
               <div className="mt-6 sm:mt-8 space-y-3">
-                {["Auto-detect debit, credit & balance columns", "Smart transaction categorization (UPI, NEFT, IMPS...)", "Extract payee names from narration text", "Works with SBI, HDFC, ICICI, Axis & more"].map((item) => (
+                {["Auto-detect debit, credit & balance columns", "Smart transaction categorization (UPI, NEFT, IMPS...)", "Full transaction descriptions with merchant details", "Works with SBI, HDFC, ICICI, Axis & more"].map((item) => (
                   <div key={item} className="flex items-start gap-3">
                     <CheckCircle2 className="w-4 h-4 sm:w-5 sm:h-5 text-emerald-400 mt-0.5 shrink-0" />
                     <span className="text-sm text-gray-300">{item}</span>
@@ -159,7 +159,7 @@ export default function HomePage() {
                   <thead>
                     <tr className="text-gray-400 border-b border-gray-700/50">
                       <th className="text-left py-2 pr-3 font-medium">Date</th>
-                      <th className="text-left py-2 pr-3 font-medium">Payee</th>
+                      <th className="text-left py-2 pr-3 font-medium">Description</th>
                       <th className="text-left py-2 pr-3 font-medium">Category</th>
                       <th className="text-right py-2 pr-3 font-medium">Debit</th>
                       <th className="text-right py-2 font-medium">Credit</th>
@@ -167,11 +167,11 @@ export default function HomePage() {
                   </thead>
                   <tbody className="text-gray-300">
                     {[
-                      { d: "15/03", p: "Swiggy", c: "UPI", cc: "violet", dr: "542.00", cr: "" },
-                      { d: "15/03", p: "Acme Corp", c: "Salary", cc: "emerald", dr: "", cr: "85,000.00" },
-                      { d: "16/03", p: "HDFC EMI", c: "EMI", cc: "orange", dr: "12,450.00", cr: "" },
-                      { d: "17/03", p: "Amazon", c: "IMPS", cc: "blue", dr: "2,999.00", cr: "" },
-                      { d: "18/03", p: "Tax Refund", c: "NEFT", cc: "cyan", dr: "", cr: "15,200.00" },
+                      { d: "15/03", p: "UPI/CR/412587/Swiggy", c: "UPI", cc: "violet", dr: "542.00", cr: "" },
+                      { d: "15/03", p: "Salary Acme Corp Pvt Ltd", c: "Salary", cc: "emerald", dr: "", cr: "85,000.00" },
+                      { d: "16/03", p: "HDFC EMI Debit Loan", c: "EMI", cc: "orange", dr: "12,450.00", cr: "" },
+                      { d: "17/03", p: "IMPS/P2A/Amazon Pay", c: "IMPS", cc: "blue", dr: "2,999.00", cr: "" },
+                      { d: "18/03", p: "NEFT CR-Tax Refund AY25", c: "NEFT", cc: "cyan", dr: "", cr: "15,200.00" },
                     ].map((r, i) => (
                       <tr key={i} className={i < 4 ? "border-b border-gray-700/30" : ""}>
                         <td className="py-2 pr-3 text-gray-500">{r.d}</td>
