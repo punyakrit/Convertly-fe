@@ -1,19 +1,167 @@
-// pdf-parse's index.js loads a test PDF on require() which breaks on Vercel.
-// Import the internal lib directly to skip that.
-async function parsePdf(buffer: Buffer): Promise<{ text: string }> {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const pdfParse = require("pdf-parse/lib/pdf-parse.js");
-  return pdfParse(buffer);
-}
 import { Parser } from "json2csv";
 import { generateOutputName } from "../helpers";
+
+// pdfreader gives x/y coordinates for every text element in a PDF.
+// We use these positions to detect table columns automatically —
+// no bank-specific parsing needed.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { PdfReader } = require("pdfreader");
+
+// Fallback: pdf-parse for PDFs that pdfreader can't handle
+async function parsePdfText(buffer: Buffer): Promise<string> {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const pdfParse = require("pdf-parse/lib/pdf-parse.js");
+  const data = await pdfParse(buffer);
+  return data.text;
+}
+
+// ====================================================================
+// TYPES
+// ====================================================================
+
+interface PdfItem {
+  x: number;
+  y: number;
+  w: number;
+  text: string;
+  page: number;
+}
+
+interface Row {
+  y: number;
+  page: number;
+  items: PdfItem[];
+}
+
+interface ColumnPositions {
+  date: number;
+  description: number;
+  debit?: number;
+  credit?: number;
+  balance?: number;
+}
 
 interface Transaction {
   date: string;
   description: string;
-  withdrawal: string;
-  deposit: string;
+  debit: string;
+  credit: string;
   balance: string;
+}
+
+// ====================================================================
+// PDF EXTRACTION — get every text element with x/y/page
+// ====================================================================
+
+function extractPdfItems(buffer: Buffer): Promise<PdfItem[]> {
+  return new Promise((resolve, reject) => {
+    const items: PdfItem[] = [];
+    let currentPage = 0;
+
+    new PdfReader().parseBuffer(buffer, (err: Error | null, item: { page?: number; x?: number; y?: number; w?: number; text?: string } | null) => {
+      if (err) { reject(err); return; }
+      if (!item) { resolve(items); return; }
+      if (item.page) { currentPage = item.page; return; }
+      if (item.text && currentPage > 0) {
+        items.push({
+          x: item.x ?? 0,
+          y: item.y ?? 0,
+          w: item.w ?? 0,
+          text: item.text,
+          page: currentPage,
+        });
+      }
+    });
+  });
+}
+
+// ====================================================================
+// GROUP ITEMS INTO ROWS (same y-position = same row)
+// ====================================================================
+
+function groupIntoRows(items: PdfItem[]): Row[] {
+  items.sort((a, b) => a.page - b.page || a.y - b.y || a.x - b.x);
+  const rows: Row[] = [];
+  let currentRow: PdfItem[] = [];
+  let currentY = -1;
+  let currentPage = -1;
+
+  for (const item of items) {
+    if (currentPage === item.page && Math.abs(item.y - currentY) < 0.3) {
+      currentRow.push(item);
+    } else {
+      if (currentRow.length > 0) rows.push({ y: currentY, page: currentPage, items: currentRow });
+      currentRow = [item];
+      currentY = item.y;
+      currentPage = item.page;
+    }
+  }
+  if (currentRow.length > 0) rows.push({ y: currentY, page: currentPage, items: currentRow });
+  return rows;
+}
+
+// ====================================================================
+// FIND TABLE HEADERS — detect column positions automatically
+// ====================================================================
+
+const HEADER_PATTERNS: Record<string, RegExp> = {
+  date: /^date$/i,
+  description: /^(transaction|description|details|particulars|narration)$/i,
+  debit: /^(debit|withdrawal|dr|withdrawals?)$/i,
+  credit: /^(credit|deposit|cr|deposits?)$/i,
+  balance: /^(balance|closing)$/i,
+};
+
+// Some headers span two rows (e.g. "Transaction" on one line, "Date" below it)
+const AMOUNT_HEADER = /^(amount|\$)$/i;
+
+function findHeaders(rows: Row[]): { headerRowIndex: number; columns: ColumnPositions } | null {
+  for (let i = 0; i < Math.min(rows.length, 60); i++) {
+    const row = rows[i];
+    const joined = row.items.map(it => it.text.trim()).join(" ");
+
+    if (!/date/i.test(joined)) continue;
+    if (!/debit|credit|balance|withdrawal|deposit|amount/i.test(joined)) continue;
+
+    const cols: Partial<ColumnPositions> = {};
+    for (const it of row.items) {
+      const t = it.text.trim();
+      for (const [colName, re] of Object.entries(HEADER_PATTERNS)) {
+        if (re.test(t)) {
+          (cols as Record<string, number>)[colName] = it.x;
+        }
+      }
+      if (AMOUNT_HEADER.test(t) && !cols.debit) {
+        cols.debit = it.x;
+      }
+    }
+
+    if (cols.date !== undefined && (cols.debit !== undefined || cols.credit !== undefined || cols.balance !== undefined)) {
+      // If no description column found, infer it as just right of date
+      if (cols.description === undefined) {
+        cols.description = (cols.date ?? 0) + 2;
+      }
+      return { headerRowIndex: i, columns: cols as ColumnPositions };
+    }
+  }
+  return null;
+}
+
+// ====================================================================
+// ASSIGN TEXT ITEMS TO COLUMNS BY X-POSITION
+// ====================================================================
+
+function assignToColumn(x: number, columns: ColumnPositions): string | null {
+  let bestCol: string | null = null;
+  let bestDist = Infinity;
+  for (const [col, colX] of Object.entries(columns)) {
+    if (colX === undefined) continue;
+    const dist = Math.abs(x - (colX as number));
+    if (dist < bestDist) { bestDist = dist; bestCol = col; }
+  }
+  // Items far to the left of the date column are reference numbers — skip them
+  if (bestCol === "date" && x < (columns.date - 1.5)) return null;
+  return bestCol;
 }
 
 // ====================================================================
@@ -26,196 +174,81 @@ const MONTH_NUM: Record<string, string> = {
   jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
 };
 
-function normalizeDate(d: string, m: string, y: string): string {
-  const dd = d.padStart(2, "0");
-  let yy = y;
-  if (yy.length === 2) yy = parseInt(yy) > 50 ? "19" + yy : "20" + yy;
-  const mm = MONTH_NUM[m.toLowerCase()] || m.padStart(2, "0");
-  return `${dd}/${mm}/${yy}`;
+const DATE_RE_MONTH = new RegExp(`^(\\d{1,2})\\s+(${MONTHS})`, "i");
+const DATE_RE_NUM = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/;
+
+function looksLikeDate(text: string): boolean {
+  const t = text.trim();
+  return DATE_RE_MONTH.test(t) || DATE_RE_NUM.test(t);
 }
 
-// All date regexes — applied to already-stitched text
-// Month-name patterns don't need digit-boundary — month name itself is the anchor.
-// This handles "S733339411-Apr-2025" where "11-Apr-2025" is glued to a txn ID.
-const DATE_PATTERNS = [
-  // DD-Mon-YYYY (most common Indian bank format, handles glued prefixes)
-  { re: new RegExp(`(\\d{1,2})[\\s\\-\\/](${MONTHS})[,\\s\\-\\/]+(\\d{4})`, "i"), groups: [1, 2, 3] },
-  // DD-Mon-YY (Canara: 22-JUL-22)
-  { re: new RegExp(`(\\d{1,2})[\\s\\-\\/](${MONTHS})[,\\s\\-\\/]+(\\d{2})(?!\\d)`, "i"), groups: [1, 2, 3] },
-  // DD/MM/YYYY or DD-MM-YYYY (needs digit boundary to avoid false matches)
-  { re: /(?<!\d)(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/, groups: [1, 2, 3] },
-  // DD/MM/YY
-  { re: /(?<!\d)(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})(?!\d)/, groups: [1, 2, 3] },
-  // YYYY-MM-DD (ISO)
-  { re: /(?<!\d)(\d{4})[\/\-](\d{2})[\/\-](\d{2})/, groups: [3, 2, 1] },
-];
+function normalizeDate(dateText: string, year: string): string {
+  const t = dateText.trim();
 
-function findDateInLine(line: string): { date: string; start: number; end: number } | null {
-  for (const { re, groups } of DATE_PATTERNS) {
-    const m = re.exec(line);
-    if (m) {
-      // Skip if followed by a dot (part of a decimal number)
-      if (line.charAt(m.index + m[0].length) === ".") continue;
-      const d = m[groups[0]];
-      const month = m[groups[1]];
-      const y = m[groups[2]];
-      // Validate: day should be 1-31, month 1-12 for numeric
-      const dayNum = parseInt(d);
-      if (dayNum < 1 || dayNum > 31) continue;
-      if (/^\d+$/.test(month)) {
-        const monNum = parseInt(month);
-        if (monNum < 1 || monNum > 12) continue;
-      }
-      return {
-        date: normalizeDate(d, month, y),
-        start: m.index,
-        end: m.index + m[0].length,
-      };
-    }
+  const monthMatch = t.match(new RegExp(`(\\d{1,2})\\s+(${MONTHS})(?:\\s*(\\d{2,4}))?`, "i"));
+  if (monthMatch) {
+    const dd = monthMatch[1].padStart(2, "0");
+    const mm = MONTH_NUM[monthMatch[2].substring(0, 3).toLowerCase()] || "01";
+    let yy = monthMatch[3] || year;
+    if (yy.length === 2) yy = parseInt(yy) > 50 ? "19" + yy : "20" + yy;
+    return `${dd}/${mm}/${yy}`;
   }
-  return null;
+
+  const numMatch = t.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+  if (numMatch) {
+    const dd = numMatch[1].padStart(2, "0");
+    const mm = numMatch[2].padStart(2, "0");
+    let yy = numMatch[3];
+    if (yy.length === 2) yy = parseInt(yy) > 50 ? "19" + yy : "20" + yy;
+    return `${dd}/${mm}/${yy}`;
+  }
+
+  return t;
 }
 
 // ====================================================================
-// AMOUNT EXTRACTION — handles Indian numbering AND concatenated amounts
+// EXTRACT STATEMENT YEAR FROM HEADER/PERIOD TEXT
 // ====================================================================
 
-function extractAmounts(text: string): number[] {
-  // First, fix concatenated amounts: "81250.0081250.00" → "81250.00 81250.00"
-  const fixed = text.replace(/(\d\.\d{2})(\d)/g, "$1 $2");
-  // Match amounts: 542.00, 1,200.00, 85,000.00, 1,23,456.78
-  const matches = fixed.match(/\d[\d,]*\.\d{2}/g);
-  if (!matches) return [];
-  return matches.map((s) => parseFloat(s.replace(/,/g, "")));
-}
+function extractYear(items: PdfItem[]): { year: string; startMonth: number; endYear: string } {
+  const allText = items.map(it => it.text).join(" ");
+  const now = new Date();
+  let year = now.getFullYear().toString();
+  let endYear = year;
+  let startMonth = 1;
 
-function isAmountOnlyLine(line: string): boolean {
-  const fixed = line.replace(/(\d\.\d{2})(\d)/g, "$1 $2");
-  const stripped = fixed.replace(/\d[\d,]*\.\d{2}/g, "").replace(/[\s\/\-,|()DrCr]/gi, "");
-  return stripped.length < 4 && extractAmounts(line).length >= 1;
-}
-
-// ====================================================================
-// DR/CR DETECTION
-// ====================================================================
-
-function detectDrCr(text: string): "DR" | "CR" | null {
-  const cleaned = text.replace(/\d[\d,]*\.\d{2}/g, "");
-  if (/\bDR\b/i.test(cleaned)) return "DR";
-  if (/\bCR\b/i.test(cleaned)) return "CR";
-  return null;
-}
-
-function directionFromDescription(desc: string): "CR" | "DR" | null {
-  if (/^by\s+transfer/i.test(desc) || /transfer\s+from/i.test(desc)) return "CR";
-  if (/^to\s+transfer/i.test(desc) || /transfer\s+to/i.test(desc)) return "DR";
-  if (/neft\s*cr\b/i.test(desc) || /upi\/cr\b/i.test(desc)) return "CR";
-  if (/neft\s*dr\b/i.test(desc) || /upi\/dr\b/i.test(desc)) return "DR";
-  if (/salary|payroll|interest\s*(credit|earned)|refund|cashback|reward|dividend|pension|subsidy/i.test(desc)) return "CR";
-  if (/emi\s*debit|loan\s*debit|insurance\s*premium/i.test(desc)) return "DR";
-  return null;
-}
-
-// ====================================================================
-// JUNK LINE FILTER
-// ====================================================================
-
-function isJunkLine(line: string): boolean {
-  const l = line.trim();
-  if (!l || l.length < 2) return true;
-  const patterns = [
-    /^page\s*\d+/i,
-    /generated\s+on\s*:/i,
-    /^statement\s*(of|period|from)/i,
-    /^account\s*(statement|details|name|number|type|no|holder|summary|currency)/i,
-    /^communication\s*address/i,
-    /^customer\s*(id|number)/i,
-    /^(ifsc|micr|cin|swift|branch)\s*(code|:)/i,
-    /^s\.?\s*no\s*transaction/i,
-    /^(txn|tran|transaction)\s*(date|id|no)\s*$/i,
-    /^value\s*(date|dt)\s*$/i,
-    /^(cheque|chq)\s*(no|number|details)?\s*$/i,
-    /^(withdrawal|debit)\s*(amt\.?|amount)?/i,
-    /^(deposit|credit)\s*(amt\.?|amount)?/i,
-    /^(closing|available|total\s*effective)\s*(balance|available)/i,
-    /^(opening|closing)\s*balance\b/i,
-    /^balance\s*(b\/f|c\/f|brought|carried|\(inr\))/i,
-    /^(narration|particulars|description)\s*$/i,
-    /^\*{3,}|^-{5,}|^={5,}|^_{5,}/,
-    /this\s+is\s+a\s+(computer|system)/i,
-    /does\s+not\s+require/i,
-    /legends?\s+(used|:)/i,
-    /toll\s*free|customer\s*care|helpline/i,
-    /www\.\w+|http/i,
-    /regd\.?\s*office/i,
-    /nomination\s*(registered|details)/i,
-    /contents\s+of\s+this/i,
-    /^available\s*balance\s*:?\s*$/i,
-    /^\u20b9/,  // starts with ₹ symbol (balance display)
-    /^inr\s*$/i,
-    /^balance\s*$/i,
-  ];
-  return patterns.some((p) => p.test(l));
-}
-
-// ====================================================================
-// TEXT PREPROCESSING — the key fix for ICICI-style PDFs
-// ====================================================================
-
-function preprocessText(text: string): string {
-  let lines = text.split("\n");
-
-  // Remove page footers like "Generated on : 20 Mar'26 (11:14 AM)Page 2 of 83"
-  lines = lines.filter(l => !/generated\s+on\s*:/i.test(l));
-  lines = lines.filter(l => !/^page\s*\d+\s*of\s*\d+\s*$/i.test(l.trim()));
-
-  // Rejoin into single string then re-split for stitching
-  let joined = lines.join("\n");
-
-  // Stitch dates split across lines:
-  // "11-Apr-\n2025" → "11-Apr-2025"
-  // "11-Apr-\r\n2025" → "11-Apr-2025"
-  const monthPattern = MONTHS.replace(/\|/g, "|");
-  const stitchRe = new RegExp(
-    `(\\d{1,2})[\\-\\/](${monthPattern})[\\-\\/]\\s*\\n\\s*(\\d{2,4})`, "gi"
+  // "18 Oct 2024 - 17 Jan 2025" or "Period 01/10/2024 to 31/12/2024"
+  const periodRe = new RegExp(
+    `(\\d{1,2})\\s*(${MONTHS})\\w*\\s*(\\d{4})\\s*(?:to|-|–)\\s*(\\d{1,2})\\s*(${MONTHS})\\w*\\s*(\\d{4})`,
+    "i"
   );
-  joined = joined.replace(stitchRe, "$1-$2-$3");
+  const pm = allText.match(periodRe);
+  if (pm) {
+    year = pm[3];
+    endYear = pm[6];
+    const sm = MONTH_NUM[pm[2].substring(0, 3).toLowerCase()];
+    if (sm) startMonth = parseInt(sm);
+    return { year, startMonth, endYear };
+  }
 
-  // Also stitch: "11-Apr\n-2025" variant
-  const stitchRe2 = new RegExp(
-    `(\\d{1,2})[\\-\\/](${monthPattern})\\s*\\n\\s*[\\-\\/](\\d{2,4})`, "gi"
-  );
-  joined = joined.replace(stitchRe2, "$1-$2-$3");
+  // "Statement starts 30 August 2025"
+  const startsRe = /(?:starts?|from|period)\s*.*?(\d{4})/i;
+  const sm = allText.match(startsRe);
+  if (sm) {
+    year = sm[1];
+    endYear = year;
+  }
 
-  // Fix concatenated amounts: "81250.0081250.00" → "81250.00 81250.00"
-  joined = joined.replace(/(\d\.\d{2})(\d)/g, "$1 $2");
+  // "Statement ends 30 September 2025"
+  const endsRe = /(?:ends?|to)\s*.*?(\d{4})/i;
+  const em = allText.match(endsRe);
+  if (em) endYear = em[1];
 
-  return joined;
+  return { year, startMonth, endYear };
 }
 
 // ====================================================================
-// HELPERS
-// ====================================================================
-
-function stripSerialPrefix(text: string): string {
-  // Remove serial number + transaction ID like "1S73333941" or "123 " at start
-  return text
-    .replace(/^\d{1,4}\s*[A-Z]\d{5,}\s*/i, "")  // "1S73333941..."
-    .replace(/^\d{1,4}\s{2,}/, "")                // "  123  ..."
-    .replace(/^\d{1,4}\s+(?=[A-Z])/i, "")         // "1 UPI/..."
-    .trim();
-}
-
-function buildDescription(parts: string[]): string {
-  return parts
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .replace(/^[\s\/|]+|[\s\/|]+$/g, "")
-    .trim();
-}
-
-// ====================================================================
-// CATEGORIZATION
+// CATEGORIZE TRANSACTIONS
 // ====================================================================
 
 function categorize(desc: string): string {
@@ -245,619 +278,658 @@ function categorize(desc: string): string {
   if (/\badjust\s*purchase\b/i.test(d)) return "Refund";
   if (/\baldi|coles|woolworths|kmart|costco\b/i.test(d)) return "Groceries";
   if (/\bhungry\s*jacks|mcdonald|domino|pizza|zomato|swiggy|uber\s*eats\b/i.test(d)) return "Food";
+  if (/\beftpos\b/i.test(d)) return "Card";
   return "Other";
 }
 
-
 // ====================================================================
-// COMMBANK / AUSTRALIAN BANK PARSER
-// ====================================================================
-// CommBank format: "DD Mon[YYYY] Description Debit$$BalanceCR" or "Description$Credit$BalanceCR"
-// Amounts prefixed with $, balance suffixed with CR. Debit/Credit separated by $$
-
-// ====================================================================
-// AUSTRALIAN BANK DETECTION & PARSER
-// Handles CommBank, ANZ, NAB — all use "DD Mon" dates + $ amounts
+// NOISE FILTERS — skip non-transaction rows
 // ====================================================================
 
-function isAustralianFormat(text: string): boolean {
-  if (/\b(CommBank|Commonwealth|NetBank)\b/i.test(text) && /\$[\d,]+\.\d{2}CR/i.test(text)) return true;
-  if (/\bANZ\b/.test(text) && /\bblank\b/.test(text)) return true;
-  if (/\bNational\s*Australia\s*Bank\b/i.test(text) || /\bNAB\b/.test(text)) return true;
-  if (/\b(Bendigo|Adelaide\s*Bank)\b/i.test(text)) return true;
-  if (/\$\s*[\d,]+\.\d{2}\s*(?:CR|DR)/i.test(text) && /\b(AUS|VIC|NSW|QLD)\b/.test(text)) return true;
+function isNoiseLine(text: string): boolean {
+  const t = text.trim();
+  if (!t) return true;
+  if (/^(page\s+\d|statement\s+\d|\(page\s+\d)/i.test(t)) return true;
+  if (/^account\s*(number|details)/i.test(t)) return true;
+  if (/opening\s*balance|closing\s*balance/i.test(t)) return true;
+  if (/transaction\s*(totals|summary)/i.test(t)) return true;
+  if (/credit\s*limit|available\s*credit|minimum\s*payment|payment\s*due/i.test(t)) return true;
+  if (/please\s+retain|taxation\s+purposes|enquir/i.test(t)) return true;
+  if (/enjoy\s+the\s+convenience|checked\s+your\s+statement/i.test(t)) return true;
   return false;
 }
 
-function parseAustralian(text: string): Transaction[] {
-  // --- Detect which bank ---
-  const isCommBank = /\b(CommBank|Commonwealth|NetBank)\b/i.test(text);
-  const isANZ = /\bANZ\b/.test(text) && /\bblank\b/.test(text);
-  const isNAB = /\bNational\s*Australia\s*Bank\b/i.test(text) || (/\bNAB\b/.test(text) && /Cr\s*$/.test(text));
-  const isBendigo = /\b(Bendigo|Adelaide\s*Bank)\b/i.test(text);
+// ====================================================================
+// EXTRACT AMOUNT FROM COLUMN TEXT
+// ====================================================================
 
-  // --- NAB preprocessing: insert spaces in spaceless text ---
-  if (isNAB) {
-    // Fix date-glued lines: "1Sep2025SumSokheng" → "1 Sep 2025 SumSokheng"
-    const nabDateRe = new RegExp(`(\\d{1,2})(${MONTHS})(\\d{4})`, "gi");
-    text = text.replace(nabDateRe, "$1 $2 $3 ");
-    // Fix amount-glued: "...500.00\n" is usually fine, but "amount Cr" needs space
-    text = text.replace(/([\d,]+\.\d{2})(Cr|Dr)/gi, "$1 $2");
-    // Remove dot separators: "SumSokheng..........500.00" → "SumSokheng 500.00"
-    text = text.replace(/\.{3,}/g, " ");
+function extractAmount(texts: string[]): string {
+  const joined = texts.join(" ").replace(/[$,\s]/g, "");
+  // Remove "CR", "DR" suffixes
+  const cleaned = joined.replace(/CR|DR/gi, "").trim();
+  const match = cleaned.match(/(\d+\.?\d*)/);
+  if (match) {
+    const num = parseFloat(match[1]);
+    if (num > 0 && num < 100000) return num.toFixed(2);
   }
+  return "";
+}
 
-  const lines = text.split("\n");
-
-  // --- Extract statement year(s) ---
-  // For cross-year statements (e.g. Oct 2024 - Jan 2025), track both start and end years
-  let statementYear = new Date().getFullYear();
-  let statementEndYear = statementYear;
-  let startMonth = 1; // month number of statement start (1-12)
-  for (const line of lines) {
-    // "Period18 Oct 2024 - 17 Jan 2025" or "28 NOVEMBER 2025 TO 31 DECEMBER 2025"
-    const periodMatch = line.match(/(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s*(\d{4})\s*(?:to|-)\s*(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s*(\d{4})/i);
-    if (periodMatch) {
-      statementYear = parseInt(periodMatch[3]);
-      statementEndYear = parseInt(periodMatch[6]);
-      const sm = MONTH_NUM[periodMatch[2].substring(0, 3).toLowerCase()];
-      if (sm) startMonth = parseInt(sm);
-      break;
-    }
-    const ym = line.match(/(\d{4})\s*(?:to|-)\s*\d/i);
-    if (ym) { statementYear = parseInt(ym[1]); statementEndYear = statementYear; break; }
-    const ym2 = line.match(/(?:period|starts?|ends?)\s*.*?(\d{4})/i);
-    if (ym2) { statementYear = parseInt(ym2[1]); statementEndYear = statementYear; break; }
-  }
-
-  // Match "DD Mon" optionally followed by "YY" or "YYYY" (Bendigo: "10 Sep 25", CommBank: "18 Oct2024")
-  const txnDateRe = new RegExp(`^(\\d{1,2})\\s+(${MONTHS})\\s*(\\d{2,4})?`, "i");
-
-  // --- Filter noise ---
-  const filtered = lines.filter(l => {
-    const t = l.trim();
-    if (!t) return false;
-    if (/^statement\s+\d+|^\(page\s+\d+/i.test(t)) return false;
-    if (/^account\s*(number|details|descriptor)/i.test(t)) return false;
-    if (/^(date|transaction\s*details?)\s*$/i.test(t)) return false;
-    if (/^transactiondebitcreditbalance$/i.test(t.replace(/\s+/g, ""))) return false;
-    if (/^13\d{3}\.\d+.*ZZ/i.test(t)) return false;
-    if (/^(SL\.R3|V\d{2}\.\d{2})/i.test(t)) return false;
-    if (/^06\s+\d{4}\s+\d+/.test(t)) return false;
-    if (/^(name|note):/i.test(t)) return false;
-    if (/smart\s*access|enjoy\s+the\s+convenience/i.test(t)) return false;
-    if (/checked\s+your\s+statement|logging\s+on\s+to/i.test(t)) return false;
-    if (/cheque\s+proceeds|questions\s+on\s+fees/i.test(t)) return false;
-    if (/the\s+date\s+of\s+transactions|appears\s+on\s+the/i.test(t)) return false;
-    if (/enquiries|need\s+to\s+get\s+in\s+touch/i.test(t) && !/\d+\.\d{2}/.test(t)) return false;
-    if (/please\s+retain|taxation\s+purposes/i.test(t)) return false;
-    if (/^page\s+\d+\s+of\s+\d+$/i.test(t)) return false;
-    if (/^withdrawals\s*\(\$\)|^deposits\s*\(\$\)|^balance\s*\(\$\)/i.test(t)) return false;
-    if (/australia\s+and\s+new\s+zealand\s+banking/i.test(t)) return false;
-    if (/transaction\s*(totals|summary)/i.test(t)) return false;
-    if (/closing\s*balance/i.test(t)) return false;
-    if (/^transaction\s*type\s*$/i.test(t)) return false;
-    if (/bendigo\s+and\s+adelaide/i.test(t)) return false;
-    if (/platinum\s*rewards/i.test(t)) return false;
-    if (/credit\s*limit|available\s*credit|annual\s*(purchase|cash)/i.test(t)) return false;
-    if (/minimum\s*payment|payment\s*due/i.test(t)) return false;
-    if (/^(free\s+chargeable|unit\s*price|fee\s*charged|staff\s*assisted)/i.test(t)) return false;
-    if (/^(cheques?\s*written|account\s*fee)\b/i.test(t)) return false;
-    if (/opening\s*balance.*total\s*debits.*total\s*credits/i.test(t)) return false;
-    if (/^\$[\d,]+\.\d{2}\s*(CR|DR)\s*\$[\d,]+/i.test(t)) return false; // summary row like "$692.42 CR $29,508.54"
-    if (/^\d+\s*$/.test(t)) return false;
-    return true;
-  });
-
-  // --- Merge continuation lines ---
-  const merged: string[] = [];
-  for (const line of filtered) {
-    const trimmed = line.trim();
-    if (txnDateRe.test(trimmed)) {
-      merged.push(trimmed);
-    } else if (merged.length > 0) {
-      merged[merged.length - 1] += " " + trimmed;
-    }
-  }
-
-  const transactions: Transaction[] = [];
-  let prevBalance = -1;
-
-  // Extract opening balance for CommBank
-  if (isCommBank) {
-    for (const line of merged) {
-      if (/opening\s*balance/i.test(line)) {
-        const obMatch = line.match(/\$([\d,]+\.\d{2})\s*(?:CR|DR)/i);
-        if (obMatch) { prevBalance = parseFloat(obMatch[1].replace(/,/g, "")); }
-        break;
-      }
-    }
-  }
-
-  for (const line of merged) {
-    const dateMatch = txnDateRe.exec(line);
-    if (!dateMatch) continue;
-
-    const day = dateMatch[1];
-    const month = dateMatch[2];
-    const capturedYear = dateMatch[3];
-    let rest = line.substring(dateMatch[0].length).trim();
-
-    // Use captured year, or check if rest starts with year, else use statement year
-    let year = statementYear.toString();
-    if (capturedYear) {
-      year = capturedYear;
-    } else {
-      const yearMatch = rest.match(/^(\d{4})\s*/);
-      if (yearMatch) {
-        year = yearMatch[1];
-        rest = rest.substring(yearMatch[0].length);
-      } else if (statementEndYear > statementYear) {
-        // Cross-year statement: use endYear for months before the start month
-        const txnMonth = parseInt(MONTH_NUM[month.substring(0, 3).toLowerCase()] || "0");
-        if (txnMonth > 0 && txnMonth < startMonth) {
-          year = statementEndYear.toString();
-        }
-      }
-    }
-
-    const dateStr = normalizeDate(day, month, year);
-
-    // Skip balance/totals/fee/summary lines
-    if (/opening\s*balance|closing\s*balance|brought\s*forward/i.test(rest)) continue;
-    if (/transaction\s*(totals|summary|type)/i.test(rest)) continue;
-    // Skip bare date-only entries or trivial "to" lines from summary tables
-    if (!rest || /^to\b/i.test(rest.trim())) continue;
-    if (/^(free|chargeable|unit\s*price|fee\s*charged|staff\s*assisted|cheques\s*written|total\s|account\s*fee)/i.test(rest)) continue;
-    if (/opening\s*balance.*total\s*debits/i.test(rest)) continue;
-
-    let withdrawal = "";
-    let deposit = "";
-    let balance = "";
-    let cleanDesc = rest;
-
-    if (isBendigo) {
-      // Bendigo: "DESC RETAIL PURCHASE DD/MM CARD NUMBER xxx AMOUNT BALANCE"
-      // or "DESC RETAIL PURCHASE RETURN DD/MM CARD NUMBER xxx AMOUNT BALANCE"
-      // Amounts are concatenated: "16.136,017.88" = 16.13 + 6,017.88
-      const isReturn = /RETAIL PURCHASE RETURN|REFUND|CREDIT/i.test(rest);
-      const isPayment = /PAYMENT\s*-?\s*THANK/i.test(rest) || /^PAYMENT\b/i.test(rest);
-
-      // Extract amounts from the full line (extractAmounts handles concatenation)
-      const amounts = extractAmounts(rest);
-      if (amounts.length >= 2) {
-        const txnAmt = amounts[amounts.length - 2];
-        const bal = amounts[amounts.length - 1];
-        balance = bal.toFixed(2);
-        if (isReturn || isPayment) {
-          deposit = txnAmt.toFixed(2);
-        } else {
-          withdrawal = txnAmt.toFixed(2);
-        }
-      } else if (amounts.length === 1) {
-        if (isReturn || isPayment) deposit = amounts[0].toFixed(2);
-        else withdrawal = amounts[0].toFixed(2);
-      }
-
-      // Clean description: remove amounts, card info, purchase type
-      cleanDesc = rest
-        .replace(/[\d,]+\.\d{2}/g, "")
-        .replace(/RETAIL PURCHASE\s*(RETURN)?/gi, "")
-        .replace(/CARD NUMBER\s*\d+[X\*]+\d*/gi, "")
-        .replace(/\d{2}\/\d{2}/g, "")  // effective date DD/MM
-        .replace(/AUS\s*$/i, "")
-        .replace(/\s+/g, " ")
-        .trim();
-
-    } else if (isCommBank) {
-      // CommBank: "desc [Card xx2466] [Value Date: DD/MM/YYYY] amount$$balanceCR"
-      // CRITICAL: Strip "Value Date: DD/MM/YYYY" FIRST — the year glues to the amount
-      // e.g. "Value Date: 11/01/20255.99$$4,487.06CR" → year 2025 + amount 5.99 = "20255.99"
-      let amountStr = rest;
-
-      // Insert space between Value Date year and amount: "20255.99" → "2025 5.99"
-      amountStr = amountStr.replace(
-        /Value\s*Date:\s*\d{1,2}\/\d{1,2}\/(\d{4})(\d)/gi,
-        "Value Date: __/$1 $2"
-      );
-
-      // Also handle case where Value Date is cleanly separated
-      amountStr = amountStr.replace(/Value\s*Date:\s*\d{1,2}\/\d{1,2}\/\d{4}/gi, " ");
-
-      // Strip Card info before amount extraction
-      amountStr = amountStr.replace(/Card\s+xx\d+/gi, " ");
-
-      // Find the balance (ends with $amount CR/DR)
-      const balMatch = amountStr.match(/\$([\d,]+\.\d{2})\s*(?:CR|DR)\s*$/i);
-      if (balMatch) {
-        balance = parseFloat(balMatch[1].replace(/,/g, "")).toFixed(2);
-        amountStr = amountStr.substring(0, amountStr.lastIndexOf(balMatch[0]));
-      }
-
-      // Detect debit vs credit from the ORIGINAL rest string (before balance removal consumed a $)
-      // Debit format: "amount$$balanceCR" → $$ means empty credit column
-      // Credit format: "$amount$balanceCR" → $ before amount, $ between amount and balance
-      const hasDollarDollar = /\d\.\d{2}\$\$/.test(rest);
-      const hasCreditPattern = /\$[\d,]+\.\d{2}\$[\d,]+\.\d{2}/.test(rest);
-
-      if (hasDollarDollar) {
-        // Debit: extract amount just before "$$" from the original rest
-        const ddMatch = rest.match(/([\d,]+\.\d{2})\$\$/);
-        if (ddMatch) {
-          withdrawal = parseFloat(ddMatch[1].replace(/,/g, "")).toFixed(2);
-        }
-      } else if (hasCreditPattern) {
-        // Credit: extract amount between $ signs from original rest
-        const crMatch = rest.match(/\$([\d,]+\.\d{2})\$/);
-        if (crMatch) {
-          deposit = parseFloat(crMatch[1].replace(/,/g, "")).toFixed(2);
-        }
-      } else {
-        // Fallback: single amount at end of amountStr
-        const singleMatch = amountStr.match(/([\d,]+\.\d{2})\$?\s*$/);
-        if (singleMatch) {
-          const before = amountStr.substring(0, amountStr.lastIndexOf(singleMatch[0]));
-          if (before.trimEnd().endsWith("$")) {
-            deposit = parseFloat(singleMatch[1].replace(/,/g, "")).toFixed(2);
-          } else {
-            withdrawal = parseFloat(singleMatch[1].replace(/,/g, "")).toFixed(2);
-          }
-        }
-      }
-
-      // Validate amount against balance delta — fixes glued ref+amount (e.g. "INV-109419279.95$$")
-      if (balance && prevBalance >= 0) {
-        const bal = parseFloat(balance);
-        const delta = bal - prevBalance;
-        const absDelta = Math.abs(delta);
-        const extractedAmt = parseFloat(withdrawal || deposit || "0");
-        if (extractedAmt > 0 && Math.abs(extractedAmt - absDelta) > 0.02) {
-          // Extracted amount doesn't match balance change — recompute from delta
-          if (delta > 0.01) { withdrawal = ""; deposit = absDelta.toFixed(2); }
-          else if (delta < -0.01) { deposit = ""; withdrawal = absDelta.toFixed(2); }
-        }
-      }
-
-      // Clean the description: remove amounts, Card info, Value Date, $ signs
-      cleanDesc = rest
-        .replace(/Value\s*Date:\s*\d{1,2}\/\d{1,2}\/\d{4}/gi, "")
-        .replace(/Card\s+xx\d+/gi, "")
-        .replace(/[\d,]+\.\d{2}/g, "")
-        .replace(/\$+/g, " ")
-        .replace(/\s*CR\s*$/i, "")
-        .replace(/AUS\s*$/i, "")
-        .replace(/\s+/g, " ")
-        .trim();
-    } else if (isANZ) {
-      // ANZ: "desc AMOUNT blank BALANCE" or "desc blank AMOUNT BALANCE"
-      // "blank" is literal text meaning the column is empty
-      // Pattern: withdrawal blank balance OR blank deposit balance
-      const anzMatch = rest.match(/([\d,]+\.\d{2})\s+blank\s+([\d,]+\.\d{2})\s*$/);
-      if (anzMatch) {
-        withdrawal = parseFloat(anzMatch[1].replace(/,/g, "")).toFixed(2);
-        balance = parseFloat(anzMatch[2].replace(/,/g, "")).toFixed(2);
-        cleanDesc = rest.substring(0, rest.indexOf(anzMatch[0]));
-      } else {
-        const anzCrMatch = rest.match(/blank\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s*$/);
-        if (anzCrMatch) {
-          deposit = parseFloat(anzCrMatch[1].replace(/,/g, "")).toFixed(2);
-          balance = parseFloat(anzCrMatch[2].replace(/,/g, "")).toFixed(2);
-          cleanDesc = rest.substring(0, rest.indexOf(anzCrMatch[0]));
-        } else {
-          // Just amounts at the end
-          const amounts = extractAmounts(rest);
-          if (amounts.length >= 2) {
-            balance = amounts[amounts.length - 1].toFixed(2);
-            withdrawal = amounts[amounts.length - 2].toFixed(2);
-            cleanDesc = rest.replace(/[\d,]+\.\d{2}/g, "").trim();
-          }
-        }
-      }
-    } else {
-      // NAB or generic Australian
-      // NAB format after preprocessing: "1 Sep 2025 SumSokheng 500.00" or "1 Sep 2025 Broughtforward 61,050.02 Cr"
-      // Balance has Cr/Dr suffix, amounts are plain numbers
-
-      // Check for Cr/Dr balance at end
-      const crMatch = rest.match(/([\d,]+\.\d{2})\s*(?:Cr|CR|Dr|DR)\s*$/i);
-      if (crMatch) {
-        balance = parseFloat(crMatch[1].replace(/,/g, "")).toFixed(2);
-        cleanDesc = rest.substring(0, rest.lastIndexOf(crMatch[0])).trim();
-      }
-
-      // NAB has columns: Debits | Credits | Balance
-      // After removing balance (with Cr), remaining amounts are debit or credit
-      const amounts = extractAmounts(cleanDesc);
-      if (amounts.length >= 2) {
-        // Two amounts: first is debit, second is credit (one might be from description)
-        withdrawal = amounts[amounts.length - 1].toFixed(2);
-        cleanDesc = cleanDesc.replace(/[\d,]+\.\d{2}/g, "").trim();
-      } else if (amounts.length === 1) {
-        const amt = amounts[0];
-        const amtStr = cleanDesc.match(/[\d,]+\.\d{2}/g);
-        if (amtStr) {
-          const lastAmt = amtStr[amtStr.length - 1];
-          const idx = cleanDesc.lastIndexOf(lastAmt);
-          const beforeAmt = cleanDesc.substring(0, idx).trim();
-          // Check if it's a deposit (credit keywords or "Cr" context)
-          if (/\bcredit|salary|deposit|refund|payment\s+received|direct\s+credit\b/i.test(beforeAmt)) {
-            deposit = amt.toFixed(2);
-          } else {
-            // Use balance to determine direction if available
-            withdrawal = amt.toFixed(2);
-          }
-          cleanDesc = beforeAmt;
-        }
-      }
-    }
-
-    // Clean description
-    cleanDesc = cleanDesc
-      .replace(/\$+/g, " ")
-      .replace(/Card\s+xx\d+/gi, "")
-      .replace(/Value\s+Date:\s*\d{1,2}\/\d{1,2}\/\d{4}/gi, "")
-      .replace(/EFFECTIVE\s+DATE\s+\d{1,2}\s+\w+\s+\d{4}/gi, "")
-      .replace(/\bblank\b/gi, "")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    if (dateStr && (withdrawal || deposit || cleanDesc)) {
-      transactions.push({ date: dateStr, description: cleanDesc || "N/A", withdrawal, deposit, balance });
-      if (balance) prevBalance = parseFloat(balance);
-    }
-  }
-
-  return transactions;
+function extractBalance(texts: string[]): string {
+  const joined = texts.join(" ");
+  const match = joined.match(/\$?([\d,]+\.\d{2})/);
+  if (match) return match[1].replace(/,/g, "");
+  return "";
 }
 
 // ====================================================================
-// MAIN PARSER
+// MAIN PARSER — generic position-based table extraction
 // ====================================================================
 
-function parseTransactions(text: string): Transaction[] {
-  // Try Australian bank format first
-  if (isAustralianFormat(text)) {
-    console.log("[Parser] Detected Australian bank format");
-    return parseAustralian(text);
+function parseTransactions(items: PdfItem[]): Transaction[] {
+  const rows = groupIntoRows(items);
+
+  // Find the header row
+  const headerInfo = findHeaders(rows);
+  if (!headerInfo) {
+    console.log("[Parser] Could not find table headers in PDF");
+    return [];
   }
 
-  // --- Preprocess: fix split lines, concatenated amounts, page footers ---
-  const processed = preprocessText(text);
-  const allLines = processed.split("\n");
+  const columns = headerInfo.columns;
+  console.log("[Parser] Detected columns:", JSON.stringify(columns));
 
-  // --- Detect DR/CR column layout (Axis, IDBI, Federal) ---
-  let hasDrCrColumn = false;
-  for (const line of allLines.slice(0, 40)) {
-    if (/\bDR\s*\/\s*CR\b/i.test(line) || /\bCR\s*\/\s*DR\b/i.test(line)) {
-      hasDrCrColumn = true;
+  // Extract year from all text
+  const { year, startMonth, endYear } = extractYear(items);
+  console.log("[Parser] Statement year:", year, "end year:", endYear);
+
+  // Collect data rows from all pages (skip header rows, stop at closing balance)
+  const dataRows: Row[] = [];
+  let inData = false;
+
+  for (const row of rows) {
+    const joined = row.items.map(it => it.text.trim()).join(" ");
+
+    // Stop at closing balance — but only after we've collected some data
+    if (inData && dataRows.length > 10 && /closing\s*balance/i.test(joined) && !/opening/i.test(joined)) {
+      break;
+    }
+
+    // Detect header rows (repeated on each page)
+    if (/\bdate\b/i.test(joined) && /\bdebit|credit|balance|withdrawal|deposit\b/i.test(joined)) {
+      inData = true;
+      continue;
+    }
+
+    if (!inData) continue;
+
+    // Skip noise
+    if (isNoiseLine(joined)) continue;
+
+    dataRows.push(row);
+  }
+
+  // Build transactions
+  const transactions: Transaction[] = [];
+  let current: Transaction | null = null;
+
+  for (const row of dataRows) {
+    // Assign each item to a column
+    const colData: Record<string, string[]> = {};
+    for (const it of row.items) {
+      const col = assignToColumn(it.x, columns);
+      if (!col) continue; // skip items that don't belong to any column
+      if (!colData[col]) colData[col] = [];
+      colData[col].push(it.text.trim());
+    }
+
+    // Check individual items in the date column for a date
+    const dateItems = colData.date || [];
+    let foundDate = "";
+    for (const dt of dateItems) {
+      if (looksLikeDate(dt)) { foundDate = dt; break; }
+    }
+
+    const descText = (colData.description || []).join(" ").trim();
+
+    // Skip rows that look like footer/noise content
+    const allText = row.items.map(it => it.text).join(" ");
+    if (/terms\s+and\s+conditions|info@|\.com\.au|authorised\s+person/i.test(allText)) continue;
+    if (/online\s*:|logging\s+on|contact\s+us/i.test(allText)) continue;
+    // Detect spaced-out character rows (PDF footer styling: "u s o n l i n e")
+    const singleCharItems = row.items.filter(it => it.text.trim().length === 1);
+    if (singleCharItems.length > row.items.length * 0.5 && row.items.length > 5) continue;
+    // Skip summary rows
+    if (/opening\s*balance.*transaction\s*type|01\s+oct\s+to\s+31/i.test(allText)) continue;
+
+    // Does this row start a new transaction?
+    if (foundDate) {
+      if (current) transactions.push(current);
+
+      // Determine year for this date
+      let txnYear = year;
+      if (endYear !== year) {
+        const monthMatch = foundDate.match(new RegExp(`\\d{1,2}\\s+(${MONTHS})`, "i"));
+        if (monthMatch) {
+          const txnMonth = parseInt(MONTH_NUM[monthMatch[1].substring(0, 3).toLowerCase()] || "0");
+          if (txnMonth > 0 && txnMonth < startMonth) txnYear = endYear;
+        }
+      }
+
+      current = {
+        date: normalizeDate(foundDate, txnYear),
+        description: descText,
+        debit: "",
+        credit: "",
+        balance: "",
+      };
+    } else if (current && descText) {
+      // Continuation line — only append if it looks like transaction content
+      if (!/document\s+the|guideline\s+only|reasonable\s+measures|authorised\s+person|contact\s+the\s+merchant/i.test(descText)) {
+        current.description += " " + descText;
+      }
+    }
+
+    if (!current) continue;
+
+    // Extract amounts (take the last non-empty value for each column)
+    const debit = extractAmount(colData.debit || []);
+    const credit = extractAmount(colData.credit || []);
+    const balance = extractBalance(colData.balance || []);
+
+    if (debit) current.debit = debit;
+    if (credit) current.credit = credit;
+    if (balance) current.balance = balance;
+  }
+  if (current) transactions.push(current);
+
+  // Filter: must have at least a debit or credit amount
+  return transactions.filter(t => t.debit || t.credit);
+}
+
+// ====================================================================
+// TEXT-BASED FALLBACK — for PDFs that pdfreader can't parse
+// ====================================================================
+
+function parseFromText(text: string): Transaction[] {
+  const lines = text.split("\n").map(l => l.trim()).filter(l => l);
+
+  // Detect format: NAB credit card (spaceless DD/MM/YYDD/MM/YY lines)
+  const nabCcLines = lines.filter(l => /^\d{2}\/\d{2}\/\d{2}\d{2}\/\d{2}\/\d{2}/.test(l));
+  if (nabCcLines.length > 5) {
+    return parseNABCreditCardText(lines);
+  }
+
+  // Detect format: NAB business account (spaceless DDMonYYYY + dot separators)
+  const nabDateRe = new RegExp(`^\\d{1,2}(${MONTHS})\\d{4}`, "i");
+  const nabDateLines = lines.filter(l => nabDateRe.test(l));
+  if (nabDateLines.length > 3 && /\.{3,}/.test(text)) {
+    return parseNABBusinessText(lines);
+  }
+
+  // Detect format: Bendigo credit card ("DD Mon YY" + amount+balance concatenated)
+  const bendigoDateRe = new RegExp(`^\\d{1,2}\\s+(${MONTHS})\\s+\\d{2}\\S`, "i");
+  const bendigoLines = lines.filter(l => bendigoDateRe.test(l));
+  if (bendigoLines.length > 3 && /Bendigo|Platinum\s*Rewards/i.test(text)) {
+    return parseBendigoCreditCardText(lines, text);
+  }
+
+  // Generic text-based: look for lines with dates and amounts
+  return parseGenericText(lines, text);
+}
+
+// --- NAB Credit Card (spaceless) ---
+function parseNABCreditCardText(lines: string[]): Transaction[] {
+  // Extract statement period for year: "09Dec25-07Jan26"
+  let stmtYear = 2025;
+  let endYear = 2026;
+  for (const line of lines.slice(0, 30)) {
+    const pm = line.match(/(\d{2})\w{3}(\d{2})\s*-\s*\d{2}\w{3}(\d{2})/);
+    if (pm) {
+      stmtYear = parseInt(pm[2]) > 50 ? 1900 + parseInt(pm[2]) : 2000 + parseInt(pm[2]);
+      endYear = parseInt(pm[3]) > 50 ? 1900 + parseInt(pm[3]) : 2000 + parseInt(pm[3]);
       break;
     }
   }
 
-  // --- Find opening balance ---
-  let prevBalance = -1;
-  for (const line of allLines) {
-    const patterns = [
-      /(?:opening\s*balance|balance\s*(?:b\/f|brought\s*forward))[:\s]*([\d,]+\.\d{2})/i,
-      /(?:balance\s*as\s*on|b\/f)[:\s]*([\d,]+\.\d{2})/i,
-      /(?:o\/b|ob)\s*:?\s*([\d,]+\.\d{2})/i,
-    ];
-    for (const pat of patterns) {
-      const m = pat.exec(line);
-      if (m) { prevBalance = parseFloat(m[1].replace(/,/g, "")); break; }
-    }
-    if (prevBalance >= 0) break;
-  }
+  // Collect transaction blobs: lines starting with DD/MM/YYDD/MM/YY
+  // Some credit transactions span 3 lines: date-pair, card-no, description+amount
+  const txnLineRe = /^(\d{2}\/\d{2}\/\d{2})(\d{2}\/\d{2}\/\d{2})(.*)$/;
+  const cardNoRe = /^[VM]\d{4}$/;
 
-  // --- Filter junk ---
-  const lines = allLines.map(l => l.trim()).filter(l => l && !isJunkLine(l));
-
-  // --- First pass: group lines into transactions ---
-  interface RawTxn {
-    date: string;
-    descParts: string[];
-    amounts: number[];
-    drCrFlag: "DR" | "CR" | null;
-  }
-  const rawTxns: RawTxn[] = [];
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i];
-    const dateInfo = findDateInLine(line);
-    if (!dateInfo) { i++; continue; }
-
-    const { date, start, end } = dateInfo;
-    const before = stripSerialPrefix(line.substring(0, start).trim());
-    const after = line.substring(end).trim();
-
-    const allParts: string[] = [];
-    if (before) allParts.push(before);
-    if (after) allParts.push(after);
-
-    
-    // Collect continuation lines until the next date
-    let j = i + 1;
-    while (j < lines.length) {
-      const nextLine = lines[j];
-      const nextDate = findDateInLine(nextLine);
-      // If next line starts with a date (within first ~20 chars), it's a new txn
-      if (nextDate && nextDate.start < 20) break;
-      allParts.push(nextLine);
-      j++;
-    }
-
-    // Separate amounts from description parts
-    // Work backwards: amount-only lines at the end are amount data
-    let amountBlockStart = allParts.length;
-    for (let k = allParts.length - 1; k >= 0; k--) {
-      if (isAmountOnlyLine(allParts[k])) amountBlockStart = k;
-      else break;
-    }
-
-    let amountText = "";
-    const descParts: string[] = [];
-    for (let k = 0; k < allParts.length; k++) {
-      if (k >= amountBlockStart) amountText += " " + allParts[k];
-      else descParts.push(allParts[k]);
-    }
-
-    // If no amount block found, check last desc part for embedded amounts
-    if (!amountText.trim() && descParts.length > 0) {
-      const lastPart = descParts[descParts.length - 1];
-      if (extractAmounts(lastPart).length >= 1) {
-        amountText = lastPart;
-        descParts.pop();
+  // Merge multi-line entries
+  const merged: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = txnLineRe.exec(lines[i]);
+    if (!m) continue;
+    let full = lines[i];
+    // If only dates (no card/desc), merge next lines
+    if (m[3].trim() === "" || cardNoRe.test(m[3].trim())) {
+      for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+        if (txnLineRe.test(lines[j])) break;
+        full += lines[j];
       }
     }
+    merged.push(full);
+  }
 
-    // Also scan all parts for amounts if still empty
-    if (!amountText.trim()) {
-      for (let k = allParts.length - 1; k >= 0; k--) {
-        if (extractAmounts(allParts[k]).length > 0) {
-          amountText = allParts.slice(k).join(" ");
-          // Remove those from descParts
-          while (descParts.length > k) descParts.pop();
+  // Build a set of known PayPal-like reference numbers (appear many times)
+  const refCounts = new Map<string, number>();
+  const allDigitBlobs = merged.map(line => {
+    const m = txnLineRe.exec(line);
+    if (!m) return "";
+    const rest = m[3].replace(/^[VM]\d{4}/, "");
+    // Get the digit blob at the end (after last letter)
+    const lastLetterIdx = rest.search(/[a-zA-Z][^a-zA-Z]*$/);
+    if (lastLetterIdx < 0) return "";
+    return rest.substring(lastLetterIdx + 1).replace(/[.,\s]/g, "");
+  });
+
+  for (const blob of allDigitBlobs) {
+    if (blob.length < 10) continue;
+    for (let len = 10; len <= 11; len++) {
+      if (blob.length >= len) {
+        const ref = blob.substring(0, len);
+        refCounts.set(ref, (refCounts.get(ref) || 0) + 1);
+      }
+    }
+  }
+  const knownRefs = Array.from(refCounts.entries())
+    .filter(([, count]) => count >= 3)
+    // Sort by length DESC (longer refs first to avoid partial matches)
+    .sort((a, b) => b[0].length - a[0].length || b[1] - a[1])
+    .map(([ref]) => ref);
+
+  // Parse each merged transaction
+  const transactions: Transaction[] = [];
+  for (const line of merged) {
+    const m = txnLineRe.exec(line);
+    if (!m) continue;
+
+    const txnDateRaw = m[1]; // DD/MM/YY
+    const rest = m[3];
+    if (!rest || rest.trim().length < 3) continue;
+
+    // Parse date
+    const [dd, mm, yy] = txnDateRaw.split("/");
+    const yyNum = parseInt(yy);
+    const fullYear = yyNum > 50 ? 1900 + yyNum : 2000 + yyNum;
+    const date = `${dd}/${mm}/${fullYear}`;
+
+    // Strip card number
+    let desc = rest.replace(/^[VM]\d{4}/, "");
+
+    // Check for CR suffix (credit)
+    const isCredit = /CR$/i.test(desc);
+    if (isCredit) desc = desc.replace(/CR$/i, "");
+
+    // Extract amount from end: find the last decimal number
+    // Handle PayPal refs glued to amounts
+    let amount = 0;
+    let amountStr = "";
+
+    // Try known refs first
+    let refFound = "";
+    for (const ref of knownRefs) {
+      const idx = desc.indexOf(ref);
+      if (idx >= 0) {
+        const afterRef = desc.substring(idx + ref.length);
+        const amtMatch = afterRef.match(/^(\d[\d,]*\.\d{2})/);
+        if (amtMatch) {
+          amount = parseFloat(amtMatch[1].replace(/,/g, ""));
+          amountStr = amtMatch[1];
+          refFound = ref;
           break;
         }
       }
     }
 
-    const amounts = extractAmounts(amountText);
-    const drCrFlag = hasDrCrColumn ? detectDrCr(allParts.join(" ")) : null;
-
-    if (date && (amounts.length > 0 || descParts.length > 0)) {
-      rawTxns.push({ date, descParts, amounts, drCrFlag });
-    }
-    i = j;
-  }
-
-  // --- Infer opening balance from first transaction if not found ---
-  if (prevBalance < 0 && rawTxns.length > 0) {
-    for (const rt of rawTxns) {
-      if (rt.amounts.length >= 2) {
-        const bal = rt.amounts[rt.amounts.length - 1];
-        const txn = rt.amounts[rt.amounts.length - 2];
-        prevBalance = Math.max(bal + txn, bal - txn, 0);
-        break;
+    if (!refFound) {
+      // No ref — amount is the last decimal number
+      const amtMatch = desc.match(/([\d,]+\.\d{2})$/);
+      if (amtMatch) {
+        amount = parseFloat(amtMatch[1].replace(/,/g, ""));
+        amountStr = amtMatch[1];
       }
     }
-    if (prevBalance < 0) prevBalance = 0;
-  }
 
-  // --- Second pass: assign debit/credit ---
-  const transactions: Transaction[] = [];
+    if (amount <= 0 || amount > 50000) continue;
 
-  for (const rt of rawTxns) {
-    const { date, descParts, amounts, drCrFlag } = rt;
-    const description = buildDescription(descParts);
-    let withdrawal = "";
-    let deposit = "";
-    let balance = "";
-
-    if (drCrFlag && amounts.length >= 1) {
-      // Single amount + DR/CR (Axis, IDBI)
-      const bal = amounts.length >= 2 ? amounts[amounts.length - 1] : -1;
-      const txn = amounts.length >= 2 ? amounts[amounts.length - 2] : amounts[0];
-      if (bal >= 0) balance = bal.toFixed(2);
-      if (drCrFlag === "DR") withdrawal = txn.toFixed(2);
-      else deposit = txn.toFixed(2);
-      if (bal >= 0) prevBalance = bal;
-
-    } else if (amounts.length >= 3) {
-      // 3+ amounts: [debit?, credit?, balance] or variations
-      const bal = amounts[amounts.length - 1];
-      balance = bal.toFixed(2);
-      if (prevBalance >= 0) {
-        const diff = bal - prevBalance;
-        const absDiff = Math.abs(diff);
-        let matched = false;
-        for (let a = amounts.length - 2; a >= 0; a--) {
-          if (Math.abs(amounts[a] - absDiff) < 0.015) {
-            if (diff > 0) deposit = amounts[a].toFixed(2);
-            else withdrawal = amounts[a].toFixed(2);
-            matched = true;
-            break;
-          }
-        }
-        if (!matched) {
-          if (Math.abs(diff) > 0.01) {
-            if (diff > 0) deposit = absDiff.toFixed(2);
-            else withdrawal = absDiff.toFixed(2);
-          }
-        }
-      } else {
-        const dir = directionFromDescription(description);
-        const nonBal = amounts.slice(0, -1).filter(a => a > 0);
-        if (nonBal.length >= 1) {
-          if (dir === "CR") deposit = nonBal[0].toFixed(2);
-          else withdrawal = nonBal[0].toFixed(2);
-        }
-      }
-      prevBalance = bal;
-
-    } else if (amounts.length === 2) {
-      // [txn, balance]
-      const bal = amounts[1];
-      const txn = amounts[0];
-      balance = bal.toFixed(2);
-
-      if (prevBalance >= 0) {
-        const diff = bal - prevBalance;
-        const absDiff = Math.abs(diff);
-        if (Math.abs(txn - absDiff) < 0.015) {
-          if (diff > 0) deposit = txn.toFixed(2);
-          else withdrawal = txn.toFixed(2);
-        } else {
-          const dir = directionFromDescription(description);
-          if (dir === "CR") deposit = txn.toFixed(2);
-          else if (dir === "DR") withdrawal = txn.toFixed(2);
-          else if (diff > 0.01) deposit = absDiff.toFixed(2);
-          else if (diff < -0.01) withdrawal = absDiff.toFixed(2);
-          else withdrawal = txn.toFixed(2);
-        }
-      } else {
-        const dir = directionFromDescription(description);
-        if (dir === "CR") deposit = txn.toFixed(2);
-        else withdrawal = txn.toFixed(2);
-      }
-      prevBalance = bal;
-
-    } else if (amounts.length === 1) {
-      const dir = directionFromDescription(description);
-      if (dir === "CR") deposit = amounts[0].toFixed(2);
-      else withdrawal = amounts[0].toFixed(2);
+    // Clean description: remove amount and ref from end
+    if (amountStr) {
+      const cutIdx = desc.lastIndexOf(amountStr);
+      if (cutIdx >= 0) desc = desc.substring(0, cutIdx);
+    }
+    if (refFound) {
+      const refIdx = desc.lastIndexOf(refFound);
+      if (refIdx >= 0) desc = desc.substring(0, refIdx);
     }
 
-    if (date && (withdrawal || deposit || description)) {
-      transactions.push({ date, description: description || "N/A", withdrawal, deposit, balance });
-    }
+    // Clean up camelCase
+    desc = desc
+      .replace(/\*/g, " ")
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/([A-Z]{2,})([A-Z][a-z])/g, "$1 $2")
+      .replace(/(\.com)([A-Za-z])/g, "$1 $2")
+      .replace(/(\d)([A-Z])/g, "$1 $2")
+      .replace(/\be Bay\b/g, "eBay")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!desc) desc = "Transaction";
+
+    transactions.push({
+      date,
+      description: desc,
+      debit: isCredit ? "" : amount.toFixed(2),
+      credit: isCredit ? amount.toFixed(2) : "",
+      balance: "",
+    });
   }
 
   return transactions;
 }
 
+// --- Bendigo Credit Card ---
+// Format: 4-line transactions:
+//   "7 Sep 257-ELEVEN 1381, TARNE ITAUS"  (date + merchant)
+//   "RETAIL PURCHASE05/09"                 (type)
+//   "CARD NUMBER 518840XXXXXXX0141"        (card)
+//   "1.505,865.65"                          (amount.XX + balance.XX concatenated)
+function parseBendigoCreditCardText(lines: string[], fullText: string): Transaction[] {
+  const transactions: Transaction[] = [];
+  const dateRe = new RegExp(`^(\\d{1,2})\\s+(${MONTHS})\\s+(\\d{2})(.+)$`, "i");
+
+  // Extract opening balance
+  let prevBal = 0;
+  const openMatch = fullText.match(/Opening\s*balance\s*\$?([\d,]+\.\d{2})/i);
+  if (openMatch) prevBal = parseFloat(openMatch[1].replace(/,/g, ""));
+
+  // Extract statement year
+  let year = new Date().getFullYear().toString();
+  const periodMatch = fullText.match(/Statement\s*period\s*.*?(\d{4})/i);
+  if (periodMatch) year = periodMatch[1];
+
+  for (let i = 0; i < lines.length; i++) {
+    const dm = dateRe.exec(lines[i]);
+    if (!dm) continue;
+
+    // Parse date
+    const dd = dm[1].padStart(2, "0");
+    const mm = MONTH_NUM[dm[2].substring(0, 3).toLowerCase()] || "01";
+    const yy = parseInt(dm[3]) > 50 ? "19" + dm[3] : "20" + dm[3];
+    const date = `${dd}/${mm}/${yy}`;
+    const merchant = dm[4].trim();
+
+    // Look ahead for amount line (within next 5 lines)
+    let amount = 0;
+    let balance = 0;
+    let txnType = "";
+
+    for (let j = i + 1; j < Math.min(i + 6, lines.length); j++) {
+      // Transaction type line
+      if (/^RETAIL\s*PURCHASE|^CASH\s*ADVANCE|^PAYMENT/i.test(lines[j])) {
+        txnType = lines[j].replace(/\d{2}\/\d{2}/, "").trim();
+      }
+      // Amount+Balance line: "1.505,865.65" (digits only, no letters)
+      if (/^[\d,.]+$/.test(lines[j]) && lines[j].includes(".")) {
+        const raw = lines[j];
+        const dot1 = raw.indexOf(".");
+        if (dot1 >= 0 && dot1 + 3 <= raw.length) {
+          const amtStr = raw.substring(0, dot1 + 3);
+          const balStr = raw.substring(dot1 + 3);
+          amount = parseFloat(amtStr.replace(/,/g, ""));
+          if (balStr) balance = parseFloat(balStr.replace(/,/g, ""));
+          break;
+        }
+      }
+      // Stop if we hit another date line
+      if (dateRe.test(lines[j])) break;
+    }
+
+    if (amount <= 0) continue;
+
+    // Determine debit vs credit by balance change
+    // Credit card: balance increase = purchase (debit), decrease = payment/return (credit)
+    const isCredit = balance > 0 && balance < prevBal;
+    const isReturn = /RETURN/i.test(txnType);
+
+    let desc = merchant
+      .replace(/,\s*/g, ", ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (txnType && !/RETAIL PURCHASE$/i.test(txnType)) {
+      desc += " (" + txnType.replace(/\s+/g, " ").trim() + ")";
+    }
+
+    transactions.push({
+      date,
+      description: desc,
+      debit: (isCredit || isReturn) ? "" : amount.toFixed(2),
+      credit: (isCredit || isReturn) ? amount.toFixed(2) : "",
+      balance: balance > 0 ? balance.toFixed(2) : "",
+    });
+
+    if (balance > 0) prevBal = balance;
+  }
+
+  return transactions;
+}
+
+// --- NAB Business Account (spaceless, dot separators) ---
+function parseNABBusinessText(lines: string[]): Transaction[] {
+  const transactions: Transaction[] = [];
+  const fusedDateRe = new RegExp(`^(\\d{1,2})(${MONTHS})(\\d{4})(.*)$`, "i");
+  const amountRe = /(?:^|\.{3,})([\d,]+\.\d{2})\s*(Cr)?\s*([\d,]+\.\d{2})?\s*(Cr)?$/i;
+
+  let currentDate = "";
+
+  // Filter out single-char lines (barcode artifacts), page headers, noise
+  const cleaned = lines.filter(l => {
+    if (l.length <= 2) return false;
+    if (/^(Statementnumber|NABBusiness|Forfurther|BusinessServicing|TransactionDetails|DateParticulars)/i.test(l)) return false;
+    if (/^(Broughtforward|Carriedforward)/i.test(l)) return false;
+    if (/^(AccountBalance|Openingbalance|Totalcredits|Totaldebits|Closingbalance)/i.test(l)) return false;
+    if (/Identifyingatransaction|NABVisaDebit|CREDITbutton|Particularscolumn/i.test(l)) return false;
+    if (/OutletDetails|AccountDetails|BSBnumber|Accountnumber/i.test(l)) return false;
+    if (/followedbythelast|whichyouinitiated|selectthe|usingyour/i.test(l)) return false;
+    // Filter long boilerplate paragraphs (>80 chars, no dot separators, no amounts at end)
+    if (l.length > 80 && !/\.{3,}/.test(l) && !/[\d,]+\.\d{2}\s*$/.test(l)) return false;
+    if (/^\d{13,}/.test(l)) return false; // barcode numbers
+    if (/^[(\dÂ?NÚ)/]$/.test(l)) return false;
+    return true;
+  });
+
+  let pendingDesc = "";
+
+  for (const line of cleaned) {
+    // Check for fused date at start: "1Sep2025SumSokheng..."
+    const dateMatch = fusedDateRe.exec(line);
+    if (dateMatch) {
+      const dd = dateMatch[1].padStart(2, "0");
+      const mm = MONTH_NUM[dateMatch[2].substring(0, 3).toLowerCase()] || "01";
+      const yyyy = dateMatch[3];
+      currentDate = `${dd}/${mm}/${yyyy}`;
+
+      const rest = dateMatch[4];
+      if (!rest || /^Broughtforward/i.test(rest)) continue;
+
+      // Process the rest of this line as a transaction line
+      pendingDesc = processNABLine(rest, currentDate, transactions, pendingDesc);
+      continue;
+    }
+
+    if (!currentDate) continue;
+
+    // Skip carried forward lines
+    if (/Carriedforward/i.test(line)) continue;
+
+    // Non-date line: check if it has an amount
+    const result = processNABLine(line, currentDate, transactions, pendingDesc);
+    pendingDesc = result;
+  }
+
+  return transactions;
+}
+
+function cleanNABDesc(desc: string): string {
+  return desc
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]{2,})([A-Z][a-z])/g, "$1 $2")
+    .replace(/(\d)([A-Za-z])/g, "$1 $2")
+    .replace(/([A-Za-z])(\d)/g, "$1 $2")
+    .replace(/\//g, " / ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Process a NAB line. Returns pending description for next line. */
+function processNABLine(line: string, date: string, transactions: Transaction[], pendingDesc: string): string {
+  // Replace dot separators with space
+  const cleaned = line.replace(/\.{3,}/g, " ").trim();
+  if (!cleaned) return pendingDesc;
+
+  // Extract amount at end: "SumSokheng 500.00" or "Hilux2019 45,000.00Cr47,050.27"
+  const amtMatch = cleaned.match(/([\d,]+\.\d{2})\s*(Cr)?\s*([\d,]+\.\d{2})?\s*(Cr)?$/i);
+
+  if (amtMatch) {
+    const amount = parseFloat(amtMatch[1].replace(/,/g, ""));
+    const isCr = !!amtMatch[2];
+    const balanceStr = amtMatch[3] ? amtMatch[3].replace(/,/g, "") : "";
+
+    if (amount <= 0 || amount > 1000000) return "";
+
+    // Description is everything before the amount
+    let desc = cleaned.substring(0, cleaned.indexOf(amtMatch[0])).trim();
+
+    // Skip standalone amount lines with no description (summary/total rows)
+    if (!desc && !pendingDesc) return "";
+
+    // Prepend pending description (context from previous non-amount line)
+    if (pendingDesc) desc = pendingDesc + " " + desc;
+
+    desc = cleanNABDesc(desc);
+    if (!desc) desc = "Transaction";
+
+    transactions.push({
+      date,
+      description: desc,
+      debit: isCr ? "" : amount.toFixed(2),
+      credit: isCr ? amount.toFixed(2) : "",
+      balance: balanceStr,
+    });
+    return ""; // clear pending
+  }
+
+  // No amount — this is a description line for the next transaction
+  return (pendingDesc ? pendingDesc + " " : "") + cleanNABDesc(cleaned);
+}
+
+// --- Generic text-based parser ---
+function parseGenericText(lines: string[], fullText: string): Transaction[] {
+  const transactions: Transaction[] = [];
+
+  // Extract year from text
+  let year = new Date().getFullYear().toString();
+  const yearMatch = fullText.match(/(?:period|statement|from)\s*.*?(\d{4})/i);
+  if (yearMatch) year = yearMatch[1];
+
+  const dateMonthRe = new RegExp(`^(\\d{1,2})\\s*(${MONTHS})\\s*(\\d{2,4})?`, "i");
+  const dateNumRe = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/;
+
+  let current: Transaction | null = null;
+
+  for (const line of lines) {
+    // Skip noise
+    if (isNoiseLine(line)) continue;
+    if (line.length < 5) continue;
+
+    // Check for date
+    let dateStr = "";
+    let rest = line;
+
+    const mm = dateMonthRe.exec(line);
+    if (mm) {
+      const txnYear = mm[3] || year;
+      dateStr = normalizeDate(mm[0], typeof txnYear === "string" ? txnYear : year);
+      rest = line.substring(mm[0].length).trim();
+    } else {
+      const nm = dateNumRe.exec(line);
+      if (nm) {
+        dateStr = normalizeDate(nm[0], year);
+        rest = line.substring(nm[0].length).trim();
+      }
+    }
+
+    if (dateStr) {
+      if (current) transactions.push(current);
+      current = { date: dateStr, description: "", debit: "", credit: "", balance: "" };
+    }
+
+    if (!current) continue;
+
+    // Extract amounts from rest
+    const amounts = rest.match(/[\d,]+\.\d{2}/g);
+    if (amounts) {
+      for (const amtStr of amounts) {
+        const amt = parseFloat(amtStr.replace(/,/g, ""));
+        if (amt <= 0 || amt > 100000) continue;
+        // Check context for credit
+        const idx = rest.indexOf(amtStr);
+        const after = rest.substring(idx + amtStr.length, idx + amtStr.length + 5);
+        if (/cr/i.test(after) || /credit|deposit|salary|refund/i.test(rest)) {
+          if (!current.credit) current.credit = amt.toFixed(2);
+        } else {
+          if (!current.debit) current.debit = amt.toFixed(2);
+        }
+      }
+      // Remove amounts from description
+      rest = rest.replace(/[\d,]+\.\d{2}/g, "").replace(/\s*(CR|DR)\b/gi, "").replace(/\$/g, "").replace(/\s+/g, " ").trim();
+    }
+
+    if (rest && rest.length > 2) {
+      current.description += (current.description ? " " : "") + rest;
+    }
+  }
+  if (current) transactions.push(current);
+
+  return transactions.filter(t => t.debit || t.credit);
+}
+
 // ====================================================================
-// EXPORT
+// EXPORTED CONVERTER
 // ====================================================================
 
 export async function bankStatementToCsv(
   buffer: Buffer,
   originalName: string
 ): Promise<{ fileName: string; csvBuffer: Buffer; mimeType: string }> {
-  const data = await parsePdf(buffer);
-  const text = data.text;
+  const items = await extractPdfItems(buffer);
 
-  console.log("=== PDF TEXT DEBUG ===");
-  console.log("Length:", text.length);
-  console.log("First 2000 chars:", text.substring(0, 2000));
-  console.log("=== END ===");
+  console.log(`[Parser] Extracted ${items.length} text items from PDF`);
 
-  if (text.trim().length < 50) {
-    throw new Error("Could not extract text from this PDF. It may be a scanned image - try a text-based statement.");
+  let transactions: Transaction[] = [];
+
+  // Check if pdfreader gave usable items (not just single chars with no page info)
+  const usableItems = items.length >= 10 &&
+    items.some(it => it.page > 0) &&
+    items.filter(it => it.text.length > 1).length > items.length * 0.3;
+
+  if (usableItems) {
+    // Primary: position-based extraction (works for most PDFs)
+    transactions = parseTransactions(items);
   }
 
-  const transactions = parseTransactions(text);
+  if (transactions.length === 0) {
+    // Fallback: text-based extraction (for PDFs that pdfreader can't handle)
+    console.log("[Parser] Position-based parsing failed, falling back to text-based");
+    const text = await parsePdfText(buffer);
+    if (text.trim().length < 50) {
+      throw new Error("Could not extract text from this PDF. It may be a scanned image - try a text-based statement.");
+    }
+    transactions = parseFromText(text);
+  }
 
   console.log(`[Parser] Found ${transactions.length} transactions`);
   if (transactions.length > 0) {
@@ -869,14 +941,29 @@ export async function bankStatementToCsv(
     throw new Error("No transactions found. The PDF may not be a recognized bank statement format.");
   }
 
-  const rows = transactions.map((t) => ({
-    Date: t.date,
-    Description: t.description,
-    Category: categorize(t.description),
-    Debit: t.withdrawal,
-    Credit: t.deposit,
-    Balance: t.balance,
-  }));
+  // Clean descriptions
+  const rows = transactions.map((t) => {
+    let desc = t.description
+      .replace(/\s+/g, " ")
+      .replace(/Card\s+xx\d+/gi, "")
+      .replace(/Value\s+Date:\s*\d{1,2}\/\d{1,2}\/\d{4}/gi, "")
+      // Remove spaced-out footer text (single chars separated by spaces)
+      .replace(/(\s[a-z]\s){5,}/gi, " ")
+      .replace(/\$[\d,]+\.\d{2}\s*CR?\s*/gi, " ")
+      .replace(/\d{2}\s+\w+\s+to\s+\d{2}\s+\w+/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    // Truncate if unreasonably long (footer bleed)
+    if (desc.length > 120) desc = desc.substring(0, 120).trim();
+    return {
+      Date: t.date,
+      Description: desc,
+      Category: categorize(t.description),
+      Debit: t.debit,
+      Credit: t.credit,
+      Balance: t.balance,
+    };
+  });
 
   const fields = ["Date", "Description", "Category", "Debit", "Credit", "Balance"];
   const parser = new Parser({ fields });
