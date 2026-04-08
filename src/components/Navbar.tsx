@@ -94,7 +94,7 @@ export function Footer() {
         <div className="flex items-center justify-center gap-2 mb-6 px-4 py-3 bg-emerald-50 border border-emerald-200 rounded-xl">
           <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
           <p className="text-xs sm:text-sm text-emerald-700 font-medium text-center">
-            Zero data stored. All uploaded files and conversions are automatically deleted within 1 hour.
+            Conversions run on our servers; outputs you save to history are kept only in this browser until you clear them.
           </p>
         </div>
 

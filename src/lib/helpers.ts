@@ -39,24 +39,3 @@ export function generateOutputName(original: string, outputExt: string): string 
   return `${sanitizeFilename(baseName)}_${timestamp}${outputExt}`;
 }
 
-/** Device ID — stable per browser, used for registration */
-export function getDeviceId(): string {
-  if (typeof window === "undefined") return "";
-  let id = localStorage.getItem("convertly_device_id");
-  if (!id) {
-    id = crypto.randomUUID();
-    localStorage.setItem("convertly_device_id", id);
-  }
-  return id;
-}
-
-/** Supabase user ID — set after registration, used for all API calls */
-export function getUserId(): string {
-  if (typeof window === "undefined") return "";
-  return localStorage.getItem("convertly_user_id") || "";
-}
-
-export function setUserId(id: string): void {
-  if (typeof window === "undefined") return;
-  localStorage.setItem("convertly_user_id", id);
-}

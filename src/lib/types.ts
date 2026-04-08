@@ -37,6 +37,18 @@ export interface ConversionResult {
   originalUrl: string;
 }
 
+export interface ConvertApiData {
+  id: string;
+  fileName: string;
+  inputType: ConversionType;
+  outputType: string;
+  convertedBase64: string;
+  originalBase64: string;
+  convertedMimeType: string;
+  originalMimeType: string;
+  originalFileName: string;
+}
+
 export interface HistoryEntry {
   id: string;
   file_name: string;

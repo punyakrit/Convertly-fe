@@ -2,7 +2,6 @@ import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import "./globals.css";
 import { Navbar, Footer } from "@/components/Navbar";
-import { UserProvider } from "@/components/UserProvider";
 
 const inter = Inter({
   variable: "--font-geist-sans",
@@ -22,11 +21,9 @@ export default function RootLayout({
   return (
     <html lang="en" className={`${inter.variable} h-full antialiased`}>
       <body className="min-h-full flex flex-col font-sans">
-        <UserProvider>
-          <Navbar />
-          <main className="flex-1">{children}</main>
-          <Footer />
-        </UserProvider>
+        <Navbar />
+        <main className="flex-1">{children}</main>
+        <Footer />
       </body>
     </html>
   );

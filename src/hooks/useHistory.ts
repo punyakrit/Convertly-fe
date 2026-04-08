@@ -2,24 +2,22 @@
 
 import { useState, useCallback, useEffect } from "react";
 import type { HistoryEntry } from "@/lib/types";
-import { getUserId } from "@/lib/helpers";
+import {
+  getHistoryEntries,
+  removeHistoryEntry,
+  clearHistory,
+} from "@/lib/historyStorage";
 
 export function useHistory() {
   const [entries, setEntries] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
-    const userId = getUserId();
-    if (!userId) return;
-
+  const refresh = useCallback(() => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/history?user_id=${userId}&limit=50&offset=0`);
-      const data = await res.json();
-      if (data.success) setEntries(data.data);
-      else setError(data.error);
+      setEntries(getHistoryEntries());
     } catch {
       setError("Failed to load history");
     } finally {
@@ -29,7 +27,7 @@ export function useHistory() {
 
   const remove = useCallback(async (id: string) => {
     try {
-      await fetch(`/api/history?id=${id}`, { method: "DELETE" });
+      removeHistoryEntry(id);
       setEntries((prev) => prev.filter((e) => e.id !== id));
     } catch {
       setError("Failed to delete item");
@@ -37,9 +35,8 @@ export function useHistory() {
   }, []);
 
   const clearAll = useCallback(async () => {
-    const userId = getUserId();
     try {
-      await fetch(`/api/history?user_id=${userId}`, { method: "DELETE" });
+      clearHistory();
       setEntries([]);
     } catch {
       setError("Failed to clear history");

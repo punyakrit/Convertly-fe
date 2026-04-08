@@ -64,7 +64,7 @@ export default function SettingsPage() {
                 <span className="text-sm font-bold text-emerald-700">Privacy First</span>
               </div>
               <p className="text-xs text-emerald-600 leading-relaxed">
-                All uploaded files and conversion outputs are automatically deleted within 1 hour. We store zero personal data.
+                Conversion results you keep in History are stored in this browser&apos;s local storage only. Clear history anytime to remove them.
               </p>
             </div>
           </div>

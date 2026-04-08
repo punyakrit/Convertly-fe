@@ -28,7 +28,7 @@ export default function ConvertPage() {
   const params = useParams();
   const toolId = params.tool as string;
   const tool = getToolById(toolId);
-  const { state, files, progress, result, error, addFiles, removeFile, convert, reset } =
+  const { state, files, progress, result, error, persistError, addFiles, removeFile, convert, reset } =
     useConvert(toolId as ConversionType);
   const [pageRange, setPageRange] = useState("");
   const [showPreview, setShowPreview] = useState(false);
@@ -75,7 +75,7 @@ export default function ConvertPage() {
           <p className="text-sm sm:text-base text-gray-500 mt-1.5 sm:mt-2">{headline.sub}</p>
           <div className="inline-flex items-center gap-1.5 mt-3 text-xs text-emerald-600">
             <Trash2 className="w-3 h-3" />
-            <span className="font-medium">Files auto-deleted within 1 hour</span>
+            <span className="font-medium">Converted files stay in this browser until you clear history</span>
           </div>
         </div>
 
@@ -174,6 +174,11 @@ export default function ConvertPage() {
           <div className="space-y-4 sm:space-y-5">
             {state === "done" && result && (
               <div className="bg-indigo-50 border border-indigo-200 rounded-2xl p-5">
+                {persistError && (
+                  <div className="mb-4 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">
+                    {persistError}
+                  </div>
+                )}
                 <div className="flex items-center gap-2 mb-4">
                   <CheckCircle2 className="w-5 h-5 text-green-500" />
                   <span className="text-sm font-semibold text-green-700">Conversion Ready</span>

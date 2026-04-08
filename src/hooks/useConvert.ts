@@ -1,8 +1,21 @@
 "use client";
 
 import { useState, useCallback } from "react";
-import type { ConversionType, ConversionResult, ConvertState } from "@/lib/types";
-import { getUserId } from "@/lib/helpers";
+import type { ConversionType, ConversionResult, ConvertState, ConvertApiData } from "@/lib/types";
+import { addHistoryEntry } from "@/lib/historyStorage";
+
+function toDataUrl(mime: string, base64: string): string {
+  return `data:${mime};base64,${base64}`;
+}
+
+function apiDataToResult(d: ConvertApiData): ConversionResult {
+  return {
+    id: d.id,
+    fileName: d.fileName,
+    convertedUrl: toDataUrl(d.convertedMimeType, d.convertedBase64),
+    originalUrl: toDataUrl(d.originalMimeType, d.originalBase64),
+  };
+}
 
 export function useConvert(toolId: ConversionType) {
   const [state, setState] = useState<ConvertState>("idle");
@@ -10,11 +23,13 @@ export function useConvert(toolId: ConversionType) {
   const [progress, setProgress] = useState(0);
   const [result, setResult] = useState<ConversionResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [persistError, setPersistError] = useState<string | null>(null);
 
   const addFiles = useCallback((newFiles: File[]) => {
     setFiles((prev) => [...prev, ...newFiles]);
     setState("selected");
     setError(null);
+    setPersistError(null);
   }, []);
 
   const removeFile = useCallback((index: number) => {
@@ -32,16 +47,11 @@ export function useConvert(toolId: ConversionType) {
       setState("uploading");
       setProgress(0);
       setError(null);
+      setPersistError(null);
 
       try {
-        const userId = getUserId();
-        if (!userId) {
-          throw new Error("User not registered yet. Please refresh the page and try again.");
-        }
-
         const formData = new FormData();
         formData.append("type", toolId);
-        formData.append("user_id", userId);
 
         const multiFileTypes: ConversionType[] = ["image-to-pdf", "merge-pdf"];
         if (multiFileTypes.includes(toolId)) {
@@ -52,8 +62,7 @@ export function useConvert(toolId: ConversionType) {
 
         if (options?.pages) formData.append("pages", options.pages);
 
-        // Use XMLHttpRequest for progress tracking
-        const res = await new Promise<ConversionResult>((resolve, reject) => {
+        const res = await new Promise<{ success: boolean; data?: ConvertApiData; error?: string }>((resolve, reject) => {
           const xhr = new XMLHttpRequest();
           xhr.open("POST", "/api/convert");
 
@@ -65,9 +74,13 @@ export function useConvert(toolId: ConversionType) {
 
           xhr.onload = () => {
             try {
-              const data = JSON.parse(xhr.responseText);
-              if (xhr.status >= 200 && xhr.status < 300 && data.success) {
-                resolve(data.data);
+              const data = JSON.parse(xhr.responseText) as {
+                success: boolean;
+                data?: ConvertApiData;
+                error?: string;
+              };
+              if (xhr.status >= 200 && xhr.status < 300 && data.success && data.data) {
+                resolve(data);
               } else {
                 reject(new Error(data.error || "Conversion failed"));
               }
@@ -80,7 +93,23 @@ export function useConvert(toolId: ConversionType) {
           xhr.send(formData);
         });
 
-        setResult(res);
+        const conv = apiDataToResult(res.data!);
+        setResult(conv);
+
+        const persisted = addHistoryEntry({
+          id: res.data!.id,
+          file_name: res.data!.fileName,
+          input_type: res.data!.inputType,
+          output_type: res.data!.outputType,
+          original_url: conv.originalUrl,
+          converted_url: conv.convertedUrl,
+          file_size: Math.floor(res.data!.convertedBase64.length * 0.75),
+          created_at: new Date().toISOString(),
+        });
+        if (!persisted.ok) {
+          setPersistError(persisted.error);
+        }
+
         setState("done");
       } catch (err) {
         const message = err instanceof Error ? err.message : "Conversion failed";
@@ -97,7 +126,8 @@ export function useConvert(toolId: ConversionType) {
     setProgress(0);
     setResult(null);
     setError(null);
+    setPersistError(null);
   }, []);
 
-  return { state, files, progress, result, error, addFiles, removeFile, convert, reset };
+  return { state, files, progress, result, error, persistError, addFiles, removeFile, convert, reset };
 }
